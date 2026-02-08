@@ -263,7 +263,10 @@ def fused_moe_kernel_gptq_awq(
             + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
         )
         b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
+        if use_fp16_accumulation:
+            b_scale = b_scale.to(compute_type)
+        else:
+            b_scale = b_scale.to(tl.float32)
 
         if has_zp and use_int4_w4a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
@@ -275,7 +278,10 @@ def fused_moe_kernel_gptq_awq(
             )
             b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
             b_zp = (b_zp >> b_zp_shifter) & 0xF
-            b_zp = b_zp.to(tl.float32)
+            if use_fp16_accumulation:
+                b_zp = b_zp.to(compute_type)
+            else:
+                b_zp = b_zp.to(tl.float32)
         elif has_zp and use_int8_w8a16:
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
             b_zp_ptrs = (
@@ -285,13 +291,22 @@ def fused_moe_kernel_gptq_awq(
                 + offs_k_true * stride_bzk
             )
             b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
-            b_zp = b_zp.to(tl.float32)
+            if use_fp16_accumulation:
+                b_zp = b_zp.to(compute_type)
+            else:
+                b_zp = b_zp.to(tl.float32)
 
         # We accumulate along the K dimension.
-        if has_zp:
-            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        if use_fp16_accumulation:
+            if has_zp:
+                b = (b.to(compute_type) - b_zp) * b_scale
+            else:
+                b = (b.to(compute_type) - b_zp_num) * b_scale
         else:
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+            if has_zp:
+                b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            else:
+                b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
         if use_fp16_accumulation:
             accumulator = tl.dot(a, b, accumulator,
                                  out_dtype=compute_type)
@@ -1198,7 +1213,7 @@ def get_moe_wna16_block_config(
                 "BLOCK_SIZE_N": 32,
                 "BLOCK_SIZE_K": 32,
                 "num_warps": 2,
-                "num_stages": 2,
+                "num_stages": 1,
             }
         if num_valid_tokens // real_top_k == 1:
             # if bs=1, use a smaller BLOCK_SIZE_N
