@@ -292,7 +292,11 @@ def fused_moe_kernel_gptq_awq(
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+        if use_fp16_accumulation:
+            accumulator = tl.dot(a, b, accumulator,
+                                 out_dtype=compute_type)
+        else:
+            accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
