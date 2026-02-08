@@ -123,6 +123,7 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_fp16_accumulation: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -229,7 +230,12 @@ def fused_moe_kernel_gptq_awq(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if use_fp16_accumulation:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N),
+                               dtype=compute_type)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N),
+                               dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -299,7 +305,8 @@ def fused_moe_kernel_gptq_awq(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
+    if not use_fp16_accumulation:
+        accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -717,6 +724,11 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        use_fp16_accumulation=compute_type != tl.float32 and (
+            not current_platform.is_cuda()
+            or current_platform.get_device_capability() is None
+            or current_platform.get_device_capability() < (8, 0)
+        ),
         **config,
     )
 
@@ -1243,7 +1255,7 @@ def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
     # CUDA WNA16 MoE kernel requires SM75+ (Turing and later).
-    # Volta (SM70) falls back to the Triton kernel.
+    # Volta (SM70) uses Triton kernel with fp16 accumulation.
     capability = current_platform.get_device_capability()
     return (
         current_platform.is_cuda()
