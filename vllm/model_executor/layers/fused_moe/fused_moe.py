@@ -308,8 +308,7 @@ def fused_moe_kernel_gptq_awq(
             else:
                 b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
         if use_fp16_accumulation:
-            accumulator = tl.dot(a, b, accumulator,
-                                 out_dtype=compute_type)
+            accumulator += tl.dot(a, b, out_dtype=compute_type)
         else:
             accumulator = tl.dot(a, b, acc=accumulator)
 
