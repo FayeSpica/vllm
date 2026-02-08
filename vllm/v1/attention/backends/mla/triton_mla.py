@@ -101,6 +101,13 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
+        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+        if get_flash_attn_version() is None:
+            raise RuntimeError(
+                "FlashAttention is not available on this device. "
+                "MLA prefill should use SDPA path."
+            )
         return super()._flash_attn_varlen_diff_headdims(
             q,
             k,

@@ -1926,13 +1926,11 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_cudnn
             self._pad_v = False
-        else:  # Use FlashAttention
-            if flash_attn_varlen_func is None:
-                raise RuntimeError(
-                    "MLA attention requires FlashAttention but it is not "
-                    "available. Please install flash_attn or use "
-                    "--attention-backend ROCM_AITER_MLA."
-                )
+        elif flash_attn_varlen_func is not None and (
+            get_flash_attn_version() is not None
+            or current_platform.is_rocm()
+        ):
+            # Use FlashAttention (requires SM 8.0+ on CUDA, or ROCm)
             logger.info_once("Using FlashAttention prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fa
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fa
@@ -1958,6 +1956,17 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 and device_capability is not None
                 and device_capability[0] == 9
             )
+        else:
+            # SDPA fallback for pre-Ampere GPUs (V100, etc.)
+            logger.info_once(
+                "Using SDPA prefill for MLA (FlashAttention not available)",
+                scope="local",
+            )
+            self._run_prefill_context_chunk = (
+                self._run_prefill_context_chunk_sdpa
+            )
+            self._run_prefill_new_tokens = self._run_prefill_new_tokens_sdpa
+            self._pad_v = False
 
         self.dcp_world_size: int = -1
 
@@ -2197,6 +2206,90 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
         return attn_out, lse.transpose(0, 1).contiguous()
+
+    def _run_prefill_new_tokens_sdpa(
+        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+    ):
+        """SDPA fallback for new tokens (causal) on pre-Ampere GPUs."""
+        cu_seqlens_q = prefill.query_start_loc
+        num_seqs = cu_seqlens_q.shape[0] - 1
+
+        if not return_softmax_lse:
+            # Fast path: use PyTorch SDPA directly
+            outputs = []
+            for i in range(num_seqs):
+                s, e = cu_seqlens_q[i], cu_seqlens_q[i + 1]
+                qi = q[s:e].transpose(0, 1).unsqueeze(0)  # (1, H, L, D_qk)
+                ki = k[s:e].transpose(0, 1).unsqueeze(0)  # (1, H, L, D_qk)
+                vi = v[s:e].transpose(0, 1).unsqueeze(0)  # (1, H, L, D_v)
+                oi = torch.nn.functional.scaled_dot_product_attention(
+                    qi, ki, vi, scale=self.scale, is_causal=True
+                )
+                outputs.append(oi.squeeze(0).transpose(0, 1))  # (L, H, D_v)
+            return torch.cat(outputs, dim=0)
+        else:
+            # Need LSE: manual attention computation
+            outputs = []
+            lses = []
+            for i in range(num_seqs):
+                s, e = cu_seqlens_q[i], cu_seqlens_q[i + 1]
+                seq_len = e - s
+                qi = q[s:e].transpose(0, 1)  # (H, L, D_qk)
+                ki = k[s:e].transpose(0, 1)  # (H, L, D_qk)
+                vi = v[s:e].transpose(0, 1)  # (H, L, D_v)
+
+                scores = torch.matmul(qi, ki.transpose(-2, -1)) * self.scale
+                causal_mask = torch.triu(
+                    torch.ones(
+                        seq_len, seq_len, device=q.device, dtype=torch.bool
+                    ),
+                    diagonal=1,
+                )
+                scores.masked_fill_(causal_mask.unsqueeze(0), float("-inf"))
+                lse = torch.logsumexp(scores, dim=-1)  # (H, L)
+                attn_weights = torch.softmax(scores, dim=-1)
+                oi = torch.matmul(
+                    attn_weights.to(vi.dtype), vi
+                )  # (H, L, D_v)
+
+                outputs.append(oi.transpose(0, 1))  # (L, H, D_v)
+                lses.append(lse)  # (H, L)
+
+            output = torch.cat(outputs, dim=0)  # (total, H, D_v)
+            lse = torch.cat(lses, dim=-1)  # (H, total)
+            return output, lse
+
+    def _run_prefill_context_chunk_sdpa(
+        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
+    ):
+        """SDPA fallback for context chunks (non-causal) on pre-Ampere GPUs."""
+        cu_seqlens_q = prefill.query_start_loc
+        cu_seqlens_k = prefill.chunked_context.cu_seq_lens[chunk_idx]
+        num_seqs = cu_seqlens_q.shape[0] - 1
+
+        outputs = []
+        lses = []
+        for i in range(num_seqs):
+            sq_s, sq_e = cu_seqlens_q[i], cu_seqlens_q[i + 1]
+            sk_s, sk_e = cu_seqlens_k[i], cu_seqlens_k[i + 1]
+
+            qi = q[sq_s:sq_e].transpose(0, 1)  # (H, Lq, D_qk)
+            ki = k[sk_s:sk_e].transpose(0, 1)  # (H, Lk, D_qk)
+            vi = v[sk_s:sk_e].transpose(0, 1)  # (H, Lk, D_v)
+
+            scores = torch.matmul(qi, ki.transpose(-2, -1)) * self.scale
+            lse = torch.logsumexp(scores, dim=-1)  # (H, Lq)
+            attn_weights = torch.softmax(scores, dim=-1)
+            oi = torch.matmul(
+                attn_weights.to(vi.dtype), vi
+            )  # (H, Lq, D_v)
+
+            outputs.append(oi.transpose(0, 1))  # (Lq, H, D_v)
+            lses.append(lse)  # (H, Lq)
+
+        output = torch.cat(outputs, dim=0)  # (total_q, H, D_v)
+        lse = torch.cat(lses, dim=-1)  # (H, total_q)
+        return output, lse
 
     def _concat_k_nope_k_pe(
         self, k_nope: torch.Tensor, k_pe: torch.Tensor
