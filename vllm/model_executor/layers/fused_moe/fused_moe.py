@@ -176,6 +176,10 @@ def fused_moe_kernel_gptq_awq(
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
+    # Clamp padding tokens to valid index to prevent out-of-bounds pointer
+    # computation. On V100 (SM70), Triton codegen may not fully suppress
+    # masked memory operations when the pointer is invalid.
+    offs_token = tl.where(token_mask, offs_token, 0)
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
@@ -1192,25 +1196,26 @@ def get_moe_wna16_block_config(
             and capability == (7, 0)
         )
         if is_volta:
-            # Volta tuning derived from local benchmarks (int4).
+            # Volta tuning: use BLOCK_SIZE_K=64 to reduce inner loop
+            # iterations and improve Triton codegen stability on SM70.
             m = max(1, num_valid_tokens // max(1, real_top_k))
             if m <= 1:
                 return {
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 32,
+                    "BLOCK_SIZE_N": 32,
+                    "BLOCK_SIZE_K": 64,
                     "num_warps": 4,
                     "num_stages": 1,
                 }
             if m <= 2:
                 return {
                     "BLOCK_SIZE_N": 32,
-                    "BLOCK_SIZE_K": 32,
+                    "BLOCK_SIZE_K": 64,
                     "num_warps": 2,
                     "num_stages": 1,
                 }
             return {
                 "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32,
+                "BLOCK_SIZE_K": 64,
                 "num_warps": 2,
                 "num_stages": 1,
             }
