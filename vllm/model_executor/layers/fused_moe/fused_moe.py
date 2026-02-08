@@ -585,6 +585,8 @@ def invoke_fused_moe_wna16_cuda_kernel(
     top_k: int,
     config: dict[str, Any],
     block_shape: list[int],
+    use_int4_w4a16: bool = True,
+    use_int8_w8a16: bool = False,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
@@ -592,7 +594,7 @@ def invoke_fused_moe_wna16_cuda_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
-    bit = 4
+    bit = 4 if use_int4_w4a16 else 8
 
     config = config.copy()
     config.update(
@@ -887,6 +889,8 @@ def dispatch_fused_moe_kernel(
                 top_k,
                 config,
                 block_shape,
+                use_int4_w4a16=use_int4_w4a16,
+                use_int8_w8a16=use_int8_w8a16,
             )
             return
         invoke_fused_moe_wna16_triton_kernel(
@@ -1209,6 +1213,11 @@ def get_moe_wna16_block_config(
 def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
+    if current_platform.is_cuda():
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability[0] < 8:
+            # Triton WNA16 kernel doesn't work on pre-Ampere GPUs
+            return True
     return (
         current_platform.is_cuda()
         and bit == 4
