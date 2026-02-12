@@ -872,6 +872,93 @@ def invoke_fused_moe_triton_kernel(
     )
 
 
+def _volta_sequential_moe_int4(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    block_shape: list[int],
+) -> None:
+    """Sequential per-expert MoE dispatch for GPTQ int4 on V100 (SM70).
+
+    The fused Triton MoE kernel (fused_moe_kernel_gptq_awq) crashes with
+    illegal memory access on SM70 due to Triton codegen issues.  This
+    function works around it by dequantizing one expert's int4 weights at
+    a time (~12 MB) to fp16 and using torch.matmul, which is proven to
+    work on V100.
+    """
+    group_size = block_shape[1]
+    N = B.size(1)
+    K = A.size(1)
+    num_valid_tokens = A.size(0) * top_k
+    block_size_m = config["BLOCK_SIZE_M"]
+
+    C_flat = C.view(-1, N)
+    topk_weights_flat = (
+        topk_weights.view(-1) if topk_weights is not None else None
+    )
+
+    # Group token IDs by expert to avoid redundant dequantization.
+    expert_tokens: dict[int, list[torch.Tensor]] = {}
+    for block_idx in range(expert_ids.size(0)):
+        expert = expert_ids[block_idx].item()
+        if expert == -1:
+            continue
+        start = block_idx * block_size_m
+        end = start + block_size_m
+        token_ids = sorted_token_ids[start:end]
+        valid_ids = token_ids[token_ids < num_valid_tokens]
+        if valid_ids.numel() == 0:
+            continue
+        expert_tokens.setdefault(expert, []).append(valid_ids)
+
+    for expert, id_list in expert_tokens.items():
+        all_ids = torch.cat(id_list)
+        real_ids = all_ids // top_k  # map to original token index
+        a = A[real_ids.long()]  # [n_tokens, K]
+
+        # --- Dequantize this expert's int4 weights to fp16 ---
+        # B[expert] is [N, K//2] uint8, each byte has 2 int4 values
+        b_packed = B[expert]  # [N, K//2]
+        low = (b_packed & 0xF).to(torch.float16)
+        high = ((b_packed >> 4) & 0xF).to(torch.float16)
+        # Interleave: k=0→low nibble, k=1→high nibble, ...
+        b_vals = torch.stack([low, high], dim=2).reshape(N, K)
+
+        # Expand per-group scales to per-element: [N, K//group_size] → [N, K]
+        scale_exp = B_scale[expert].to(torch.float16).repeat_interleave(
+            group_size, dim=1
+        )[:, :K]
+
+        if B_zp is not None:
+            # Zero points packed along N: B_zp[expert] is [N//2, K//group_size]
+            b_zp_e = B_zp[expert]
+            zp_low = (b_zp_e & 0xF).to(torch.float16)
+            zp_high = ((b_zp_e >> 4) & 0xF).to(torch.float16)
+            zp = torch.stack([zp_low, zp_high], dim=1).reshape(N, -1)
+            zp_exp = zp.repeat_interleave(group_size, dim=1)[:, :K]
+            b_fp16 = ((b_vals - zp_exp) * scale_exp).T  # [K, N]
+        else:
+            # Symmetric quantization: zero point = 8
+            b_fp16 = ((b_vals - 8.0) * scale_exp).T  # [K, N]
+
+        out = torch.matmul(a, b_fp16)  # [n_tokens, N]
+
+        if mul_routed_weight and topk_weights_flat is not None:
+            w = topk_weights_flat[all_ids.long()]
+            out = out * w.unsqueeze(1)
+
+        C_flat[all_ids.long()] = out.to(C.dtype)
+
+
 def dispatch_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -933,6 +1020,40 @@ def dispatch_fused_moe_kernel(
                 use_int8_w8a16=use_int8_w8a16,
             )
             return
+
+        # On Volta (SM70), the Triton fused MoE GPTQ kernel
+        # (fused_moe_kernel_gptq_awq) crashes with illegal memory
+        # access due to Triton codegen issues.  Fall back to
+        # sequential per-expert dispatch with torch.matmul.
+        capability = current_platform.get_device_capability()
+        if (
+            use_int4_w4a16
+            and current_platform.is_cuda()
+            and capability is not None
+            and capability == (7, 0)
+            and sorted_token_ids is not None
+        ):
+            logger.warning_once(
+                "Using sequential MoE dispatch for GPTQ int4 on "
+                "V100 (SM70) to work around Triton kernel crash."
+            )
+            _volta_sequential_moe_int4(
+                A,
+                B,
+                C,
+                B_scale,
+                B_zp,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                top_k,
+                config,
+                block_shape,
+            )
+            return
+
         invoke_fused_moe_wna16_triton_kernel(
             A,
             B,
