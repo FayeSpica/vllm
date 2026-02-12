@@ -3,7 +3,6 @@
 
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.gptq_triton import (
     GPTQ_TRITON_SUPPORTED_GROUP_SIZES,
     gptq_gemm_triton,
@@ -19,6 +18,54 @@ from vllm.model_executor.parameter import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import HAS_TRITON
+
+
+def _reorder_packed_qweight_by_perm(
+    qweight: torch.Tensor, perm: torch.Tensor, bits: int
+) -> torch.Tensor:
+    """Reorder packed quantized weight rows along the K dimension.
+
+    This performs the same row reordering as make_sequential_Xbit_kernel in
+    the CUDA code, but without the subsequent bit-level shuffle that
+    shuffle_Xbit_kernel would apply.
+
+    Args:
+        qweight: Packed weight tensor [K // pack_factor, N], int32.
+        perm: Permutation array (argsort of g_idx), length K.
+        bits: Number of bits per weight element (e.g. 4).
+    Returns:
+        New qweight tensor with rows reordered according to perm.
+    """
+    assert bits == 4, "Only 4-bit packing is supported"
+    pack_factor = 32 // bits  # 8 for 4-bit
+    K_packed, N = qweight.shape
+    K = K_packed * pack_factor
+
+    assert perm.shape[0] == K
+
+    # Unpack: extract each 4-bit value into its own row -> [K, N] uint8
+    # qweight[k // 8, n] >> ((k % 8) * 4) & 0xF
+    k_indices = torch.arange(K, device=qweight.device)
+    packed_row = k_indices // pack_factor  # [K]
+    bit_offset = (k_indices % pack_factor) * bits  # [K]
+
+    # Gather packed rows: [K, N]
+    packed_vals = qweight[packed_row]  # [K, N]
+    # Extract individual values
+    unpacked = (packed_vals >> bit_offset[:, None]) & ((1 << bits) - 1)
+
+    # Reorder along K dimension
+    unpacked = unpacked[perm.long()]
+
+    # Repack: pack 8 consecutive values into each int32
+    unpacked = unpacked.to(torch.int32)
+    new_qweight = torch.zeros(
+        (K_packed, N), dtype=torch.int32, device=qweight.device
+    )
+    for i in range(pack_factor):
+        new_qweight |= unpacked[i::pack_factor] << (i * bits)
+
+    return new_qweight
 
 
 class TritonLinearKernel(MPLinearKernel):
@@ -130,7 +177,16 @@ class TritonLinearKernel(MPLinearKernel):
             )
             x_cont = x.data.contiguous()
             if g_idx.numel() > 0:
-                ops.gptq_shuffle(x_cont, g_idx, c.weight_type.size_bits)
+                # Reorder weight rows along K dimension according to
+                # g_idx permutation.  We do NOT call ops.gptq_shuffle()
+                # because it also applies a bit-level shuffle
+                # (shuffle_4bit_8) designed for the Exllama CUDA kernel's
+                # deq2 LUT. The Triton kernel expects the original GPTQ
+                # packing where k-th 4-bit value is at bits [k*4+3 : k*4]
+                # within each int32, so only the row reordering is needed.
+                x_cont = _reorder_packed_qweight_by_perm(
+                    x_cont, g_idx, c.weight_type.size_bits
+                )
             return x_cont
 
         def transform_w_s(x):

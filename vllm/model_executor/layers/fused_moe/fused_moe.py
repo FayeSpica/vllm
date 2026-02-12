@@ -716,30 +716,6 @@ def invoke_fused_moe_wna16_triton_kernel(
         )
     )
 
-    # Debug: sync and log tensor info before kernel launch
-    capability = current_platform.get_device_capability()
-    is_volta_debug = (current_platform.is_cuda() and capability is not None
-                      and capability == (7, 0))
-    if is_volta_debug:
-        torch.cuda.synchronize()
-        logger.warning(
-            "MoE WNA16 Triton kernel launch: "
-            "A=%s(%s) B=%s(%s) C=%s(%s) "
-            "B_scale=%s(%s) B_zp=%s(%s) "
-            "B.stride=%s A.stride=%s C.stride=%s "
-            "B_scale.stride=%s "
-            "EM=%d num_tokens=%d top_k=%d "
-            "block_k_diviable=%s config=%s",
-            A.shape, A.dtype, B.shape, B.dtype, C.shape, C.dtype,
-            B_scale.shape, B_scale.dtype,
-            B_zp.shape if B_zp is not None else None,
-            B_zp.dtype if B_zp is not None else None,
-            B.stride(), A.stride(), C.stride(),
-            B_scale.stride(),
-            EM, num_tokens, top_k,
-            A.size(1) % config["BLOCK_SIZE_K"] == 0, config,
-        )
-
     fused_moe_kernel_gptq_awq[grid](
         A,
         B,
@@ -783,9 +759,6 @@ def invoke_fused_moe_wna16_triton_kernel(
         **config,
     )
 
-    if is_volta_debug:
-        torch.cuda.synchronize()
-        logger.warning("MoE WNA16 Triton kernel completed successfully")
 
 
 def invoke_fused_moe_triton_kernel(
