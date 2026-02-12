@@ -907,22 +907,26 @@ def _volta_sequential_moe_int4(
     )
 
     # Group token IDs by expert to avoid redundant dequantization.
+    E = B.size(0)
     expert_tokens: dict[int, list[torch.Tensor]] = {}
     for block_idx in range(expert_ids.size(0)):
         expert = expert_ids[block_idx].item()
-        if expert == -1:
+        if expert == -1 or expert < 0 or expert >= E:
             continue
         start = block_idx * block_size_m
-        end = start + block_size_m
+        end = min(start + block_size_m, sorted_token_ids.size(0))
         token_ids = sorted_token_ids[start:end]
         valid_ids = token_ids[token_ids < num_valid_tokens]
         if valid_ids.numel() == 0:
             continue
         expert_tokens.setdefault(expert, []).append(valid_ids)
 
+    M = A.size(0)
     for expert, id_list in expert_tokens.items():
         all_ids = torch.cat(id_list)
         real_ids = all_ids // top_k  # map to original token index
+        # Clamp to prevent out-of-bounds indexing; log if triggered.
+        real_ids = real_ids.clamp(max=M - 1)
         a = A[real_ids.long()]  # [n_tokens, K]
 
         # --- Dequantize this expert's int4 weights to fp16 ---
@@ -953,10 +957,12 @@ def _volta_sequential_moe_int4(
         out = torch.matmul(a, b_fp16)  # [n_tokens, N]
 
         if mul_routed_weight and topk_weights_flat is not None:
-            w = topk_weights_flat[all_ids.long()]
+            w_ids = all_ids.clamp(max=topk_weights_flat.size(0) - 1)
+            w = topk_weights_flat[w_ids.long()]
             out = out * w.unsqueeze(1)
 
-        C_flat[all_ids.long()] = out.to(C.dtype)
+        c_ids = all_ids.clamp(max=C_flat.size(0) - 1)
+        C_flat[c_ids.long()] = out.to(C.dtype)
 
 
 def dispatch_fused_moe_kernel(
