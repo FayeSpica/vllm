@@ -709,7 +709,7 @@ def invoke_fused_moe_wna16_triton_kernel(
             num_valid_tokens=num_tokens,
             size_k=A.size(1),
             size_n=B.size(1),
-            num_experts=B.size(1),
+            num_experts=B.size(0),
             group_size=block_shape[1],
             real_top_k=top_k,
             block_size_m=config["BLOCK_SIZE_M"],
@@ -751,11 +751,11 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
-        use_fp16_accumulation=compute_type != tl.float32 and (
-            not current_platform.is_cuda()
-            or current_platform.get_device_capability() is None
-            or current_platform.get_device_capability() < (8, 0)
-        ),
+        # On CUDA, always use fp32 accumulation with tl.dot(acc=).
+        # The fp16 out_dtype= form can generate problematic WMMA
+        # instructions on SM70 (Volta), causing illegal memory access.
+        use_fp16_accumulation=compute_type != tl.float32
+        and not current_platform.is_cuda(),
         **config,
     )
 
