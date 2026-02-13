@@ -454,6 +454,11 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+    elif current_platform.get_device_capability() == (7, 0):
+        # V100 (SM 7.0) only has 96 KB shared memory.  num_stages=2
+        # requires ~100 KB for MLA decode (BLOCK_DMODEL=512 etc.),
+        # exceeding the hardware limit.  Reduce to 1 stage.
+        num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
         q,
