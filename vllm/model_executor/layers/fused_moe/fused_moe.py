@@ -895,10 +895,14 @@ def _volta_sequential_moe_int4(
     a time (~12 MB) to fp16 and using torch.matmul, which is proven to
     work on V100.
     """
+    M = A.size(0)
+    if M == 0:
+        return
+
     group_size = block_shape[1]
     N = B.size(1)
     K = A.size(1)
-    num_valid_tokens = A.size(0) * top_k
+    num_valid_tokens = M * top_k
     block_size_m = config["BLOCK_SIZE_M"]
 
     C_flat = C.view(-1, N)
@@ -921,12 +925,11 @@ def _volta_sequential_moe_int4(
             continue
         expert_tokens.setdefault(expert, []).append(valid_ids)
 
-    M = A.size(0)
     for expert, id_list in expert_tokens.items():
         all_ids = torch.cat(id_list)
         real_ids = all_ids // top_k  # map to original token index
-        # Clamp to prevent out-of-bounds indexing; log if triggered.
-        real_ids = real_ids.clamp(max=M - 1)
+        # Clamp to prevent out-of-bounds indexing.
+        real_ids = real_ids.clamp(min=0, max=M - 1)
         a = A[real_ids.long()]  # [n_tokens, K]
 
         # --- Dequantize this expert's int4 weights to fp16 ---
@@ -957,11 +960,12 @@ def _volta_sequential_moe_int4(
         out = torch.matmul(a, b_fp16)  # [n_tokens, N]
 
         if mul_routed_weight and topk_weights_flat is not None:
-            w_ids = all_ids.clamp(max=topk_weights_flat.size(0) - 1)
+            w_ids = all_ids.clamp(min=0,
+                                  max=topk_weights_flat.size(0) - 1)
             w = topk_weights_flat[w_ids.long()]
             out = out * w.unsqueeze(1)
 
-        c_ids = all_ids.clamp(max=C_flat.size(0) - 1)
+        c_ids = all_ids.clamp(min=0, max=C_flat.size(0) - 1)
         C_flat[c_ids.long()] = out.to(C.dtype)
 
 
