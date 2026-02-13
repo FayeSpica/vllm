@@ -456,6 +456,12 @@ class Worker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
+        # Cap warmup sizes to max_num_batched_tokens.  compile_range.end
+        # can exceed max_num_batched_tokens (e.g. due to speculative
+        # decoding offset) and _dummy_run asserts the size fits.
+        max_warmup = self.scheduler_config.max_num_batched_tokens
+        warmup_sizes = [s for s in warmup_sizes if s <= max_warmup]
+
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
