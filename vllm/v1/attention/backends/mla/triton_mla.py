@@ -164,8 +164,9 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         inv_mask = positions >= seq_lens.unsqueeze(1)  # [B, max_sl]
 
         # Scores: [B, H, D] @ [B, D, max_sl] → [B, H, max_sl]
-        # Use fp16 matmul to leverage V100 tensor cores (125 vs 15.7 TFLOPS)
-        scores = torch.matmul(q, kv.transpose(1, 2)).float() * self.scale
+        # float32 for numerical stability on V100
+        scores = torch.matmul(
+            q.float(), kv.float().transpose(1, 2)) * self.scale
         scores.masked_fill_(inv_mask.unsqueeze(1), float('-inf'))
 
         # Numerically stable softmax in float32
@@ -176,9 +177,8 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         attn_w = exp_s / sum_exp  # [B, H, max_sl]
 
         # Output: [B, H, max_sl] @ [B, max_sl, D_nope] → [B, H, D_nope]
-        # Cast attn_w back to fp16 for tensor core matmul
-        v = kv[:, :, :D_nope]
-        o = torch.matmul(attn_w.to(q.dtype), v)
+        v = kv[:, :, :D_nope].float()
+        o = torch.matmul(attn_w, v).to(q.dtype)
 
         # LSE for merge with prefill
         lse = (max_s.squeeze(-1) + torch.log(

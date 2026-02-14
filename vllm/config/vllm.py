@@ -842,10 +842,9 @@ class VllmConfig:
             else:
                 self.compilation_config.cudagraph_num_of_warmups = 1
 
-            # V100 (SM 7.0) GPTQ MoE: use PIECEWISE cudagraphs so that
-            # Triton MoE kernels run outside CUDA graph capture (avoiding
-            # illegal memory access) while other ops still benefit from
-            # cudagraph kernel-launch savings.
+            # Disable CUDA graphs on V100 (SM 7.0) for GPTQ MoE models.
+            # Triton kernels (GPTQ dequant, fused MoE) produce corrupted
+            # output when replayed inside CUDA graphs on SM 7.0.
             if (
                 self.model_config is not None
                 and self.model_config.is_moe
@@ -855,14 +854,13 @@ class VllmConfig:
                 and self.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
-                logger.info(
-                    "Using PIECEWISE CUDA graphs for GPTQ MoE on V100 "
-                    "(SM 7.0): MoE ops run outside graphs to avoid "
-                    "Triton/CUDA context corruption."
+                logger.warning(
+                    "Disabling CUDA graphs for GPTQ MoE on V100 (SM 7.0) "
+                    "to avoid corrupted output with Triton kernels."
                 )
-                self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.PIECEWISE
-                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                self.compilation_config.max_cudagraph_capture_size = 0
+                self.compilation_config.cudagraph_capture_sizes = []
 
             self._set_cudagraph_sizes()
         else:
@@ -957,26 +955,6 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
-
-        # V100 GPTQ MoE: add MoE ops to splitting_ops so Triton MoE
-        # kernels run outside CUDA graph capture in PIECEWISE mode.
-        if (
-            self.model_config is not None
-            and self.model_config.is_moe
-            and self.model_config.quantization == "gptq"
-            and current_platform.is_cuda()
-            and current_platform.get_device_capability() == (7, 0)
-            and self.compilation_config.splitting_ops is not None
-        ):
-            moe_ops = [
-                "vllm::moe_forward",
-                "vllm::moe_forward_shared",
-                "vllm::inplace_fused_experts",
-                "vllm::outplace_fused_experts",
-            ]
-            for op in moe_ops:
-                if op not in self.compilation_config.splitting_ops:
-                    self.compilation_config.splitting_ops.append(op)
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism or dynamo partitioning,
