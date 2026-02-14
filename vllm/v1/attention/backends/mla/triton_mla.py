@@ -132,55 +132,57 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """PyTorch MLA decode attention for V100 (SM 7.0).
+        """Vectorized PyTorch MLA decode attention for V100 (SM 7.0).
 
         The Triton MLA decode kernel OOMs on V100 because VRAM is fully
-        occupied by model weights + KV cache.  This fallback uses PyTorch
-        matmul + softmax in float32.
+        occupied by model weights + KV cache.  This fallback uses batched
+        PyTorch matmul (leveraging cuBLAS / tensor cores) with fp32 softmax.
         """
         B, H, D = q.shape
         D_nope = self.kv_lora_rank
-        D_pe = D - D_nope
 
         block_table = attn_metadata.decode.block_table
         seq_lens = attn_metadata.decode.seq_lens
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
-        kv_cache = kv_c_and_k_pe_cache
+        max_sl = seq_lens.max().item()
+        if max_sl == 0:
+            o = torch.zeros(B, H, D_nope, dtype=q.dtype, device=q.device)
+            lse = torch.zeros(B, H, dtype=q.dtype, device=q.device)
+            return o, lse
 
-        o = torch.zeros(B, H, D_nope, dtype=q.dtype, device=q.device)
-        lse = torch.zeros(B, H, dtype=q.dtype, device=q.device)
+        # Gather all KV cache pages in one indexing op
+        max_num_pages = (max_sl + PAGE_SIZE - 1) // PAGE_SIZE
+        page_indices = block_table[:, :max_num_pages]  # [B, max_pages]
+        kv = kv_c_and_k_pe_cache[page_indices]  # [B, max_pages, PAGE_SIZE, D]
+        kv = kv.reshape(B, -1, D)[:, :max_sl, :]  # [B, max_sl, D]
 
-        for b in range(B):
-            sl = seq_lens[b].item()
-            if sl == 0:
-                continue
+        # Attention mask for variable sequence lengths
+        positions = torch.arange(
+            max_sl, device=q.device).unsqueeze(0)  # [1, max_sl]
+        # True where position should be masked (invalid)
+        inv_mask = positions >= seq_lens.unsqueeze(1)  # [B, max_sl]
 
-            num_pages = (sl + PAGE_SIZE - 1) // PAGE_SIZE
-            pages = block_table[b, :num_pages]
-            kv = kv_cache[pages].reshape(-1, D)[:sl]  # [sl, D]
+        # Scores: [B, H, D] @ [B, D, max_sl] → [B, H, max_sl]
+        # Use fp16 matmul to leverage V100 tensor cores (125 vs 15.7 TFLOPS)
+        scores = torch.matmul(q, kv.transpose(1, 2)).float() * self.scale
+        scores.masked_fill_(inv_mask.unsqueeze(1), float('-inf'))
 
-            k_nope = kv[:, :D_nope]   # [sl, D_nope]
-            k_pe = kv[:, D_nope:]     # [sl, D_pe]
-            v = kv[:, :D_nope]        # [sl, D_nope]  (MLA: V = compressed KV)
+        # Numerically stable softmax in float32
+        max_s = scores.max(dim=-1, keepdim=True).values  # [B, H, 1]
+        exp_s = torch.exp(scores - max_s)
+        exp_s.masked_fill_(inv_mask.unsqueeze(1), 0.0)
+        sum_exp = exp_s.sum(dim=-1, keepdim=True)  # [B, H, 1]
+        attn_w = exp_s / sum_exp  # [B, H, max_sl]
 
-            q_b = q[b]               # [H, D]
-            q_nope = q_b[:, :D_nope]  # [H, D_nope]
-            q_pe = q_b[:, D_nope:]    # [H, D_pe]
+        # Output: [B, H, max_sl] @ [B, max_sl, D_nope] → [B, H, D_nope]
+        # Cast attn_w back to fp16 for tensor core matmul
+        v = kv[:, :, :D_nope]
+        o = torch.matmul(attn_w.to(q.dtype), v)
 
-            scores = (
-                torch.matmul(q_nope.float(), k_nope.float().T)
-                + torch.matmul(q_pe.float(), k_pe.float().T)
-            ) * self.scale  # [H, sl]
-
-            max_s = scores.max(dim=-1, keepdim=True).values
-            exp_s = torch.exp(scores - max_s)
-            sum_exp = exp_s.sum(dim=-1, keepdim=True)
-            attn_w = exp_s / sum_exp  # [H, sl]
-
-            o[b] = torch.matmul(attn_w, v.float()).to(q.dtype)  # [H, D_nope]
-            lse[b] = (max_s.squeeze(-1) + torch.log(
-                sum_exp.squeeze(-1))).to(q.dtype)
+        # LSE for merge with prefill
+        lse = (max_s.squeeze(-1) + torch.log(
+            sum_exp.squeeze(-1))).to(q.dtype)  # [B, H]
 
         return o, lse
 
