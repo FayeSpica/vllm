@@ -1203,11 +1203,13 @@ def get_moe_wna16_block_config(
             and capability == (7, 0)
         )
         if is_volta:
-            # Volta: use minimal block sizes for SM70 Triton stability.
+            # Volta (SM70): moderate block sizes with 4 warps for better
+            # occupancy on memory-bound decode.  BLOCK_SIZE_K=64 halves
+            # the K-loop iterations vs the previous K=32 config.
             return {
                 "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32,
-                "num_warps": 2,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 4,
                 "num_stages": 1,
             }
         if num_valid_tokens // real_top_k == 1:

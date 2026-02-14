@@ -127,9 +127,9 @@ def gptq_gemm_triton(
     scales: torch.Tensor,  # [K // group_size, N], float16
     group_size: int,
     split_k_iters: int = 1,
-    block_size_m: int = 32,
-    block_size_n: int = 32,
-    block_size_k: int = 32,
+    block_size_m: int = 16,
+    block_size_n: int = 64,
+    block_size_k: int = 64,
 ) -> torch.Tensor:
     """
     GPTQ Triton GEMM for 4-bit symmetric quantization.
@@ -180,9 +180,16 @@ def gptq_gemm_triton(
         split_k_iters,
     )
 
-    result = torch.zeros((split_k_iters, M, N),
-                         dtype=scales.dtype,
-                         device=input.device)
+    # With split_k_iters==1 each output position is written exactly once
+    # by the kernel, so we can skip the memset kernel from torch.zeros.
+    if split_k_iters == 1:
+        result = torch.empty((split_k_iters, M, N),
+                             dtype=scales.dtype,
+                             device=input.device)
+    else:
+        result = torch.zeros((split_k_iters, M, N),
+                             dtype=scales.dtype,
+                             device=input.device)
 
     gptq_gemm_kernel[grid](
         input,
