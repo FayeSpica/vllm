@@ -125,6 +125,8 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             **kwargs,
         )
 
+    _volta_debug_count = 0
+
     def _volta_forward_mqa(
         self,
         q: torch.Tensor,
@@ -148,6 +150,21 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         # kv_c_and_k_pe_cache: [num_blocks, PAGE_SIZE, D]
         kv_cache = kv_c_and_k_pe_cache
+
+        do_debug = TritonMLAImpl._volta_debug_count < 5
+        if do_debug:
+            TritonMLAImpl._volta_debug_count += 1
+            q_nan = torch.isnan(q).any().item()
+            kv_nan = torch.isnan(kv_cache).any().item()
+            logger.debug(
+                "Volta MQA step %d: B=%d H=%d D=%d D_nope=%d D_pe=%d "
+                "PAGE_SIZE=%d q_has_nan=%s kv_cache_has_nan=%s "
+                "q min=%.4f max=%.4f kv min=%.4f max=%.4f",
+                TritonMLAImpl._volta_debug_count, B, H, D, D_nope, D_pe,
+                PAGE_SIZE, q_nan, kv_nan,
+                q.float().min().item(), q.float().max().item(),
+                kv_cache.float().min().item(), kv_cache.float().max().item(),
+            )
 
         o = torch.zeros(B, H, D_nope, dtype=q.dtype, device=q.device)
         lse = torch.zeros(B, H, dtype=q.dtype, device=q.device)
@@ -184,6 +201,21 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             o[b] = torch.matmul(attn_w, v.float()).to(q.dtype)  # [H, D_nope]
             lse[b] = (max_s.squeeze(-1) + torch.log(
                 sum_exp.squeeze(-1))).to(q.dtype)
+
+            if do_debug and b == 0:
+                logger.debug(
+                    "  b=%d sl=%d scores_nan=%s scores min=%.4f max=%.4f "
+                    "attn_w_nan=%s o_nan=%s o min=%.4f max=%.4f "
+                    "kv_nan=%s kv min=%.4f max=%.4f",
+                    b, sl,
+                    torch.isnan(scores).any().item(),
+                    scores.min().item(), scores.max().item(),
+                    torch.isnan(attn_w).any().item(),
+                    torch.isnan(o[b]).any().item(),
+                    o[b].float().min().item(), o[b].float().max().item(),
+                    torch.isnan(kv).any().item(),
+                    kv.float().min().item(), kv.float().max().item(),
+                )
 
         return o, lse
 
