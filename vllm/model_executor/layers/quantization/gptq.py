@@ -427,6 +427,8 @@ class GPTQLinearMethod(LinearMethodBase):
 
         return weight
 
+    _dequant_debug_logged = False
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -448,6 +450,28 @@ class GPTQLinearMethod(LinearMethodBase):
                 self.quant_config.group_size,
             )
             output = torch.matmul(reshaped_x, weight_fp16)
+
+            if not GPTQLinearMethod._dequant_debug_logged:
+                GPTQLinearMethod._dequant_debug_logged = True
+                logger.debug(
+                    "GPTQ V100 dequant debug: "
+                    "qweight=%s scales=%s x=%s weight=%s output=%s | "
+                    "weight stats: min=%.4f max=%.4f mean=%.4f std=%.4f | "
+                    "output stats: min=%.4f max=%.4f mean=%.4f std=%.4f",
+                    list(layer.qweight.shape),
+                    list(layer.scales.shape),
+                    list(x.shape),
+                    list(weight_fp16.shape),
+                    list(output.shape),
+                    weight_fp16.float().min().item(),
+                    weight_fp16.float().max().item(),
+                    weight_fp16.float().mean().item(),
+                    weight_fp16.float().std().item(),
+                    output.float().min().item(),
+                    output.float().max().item(),
+                    output.float().mean().item(),
+                    output.float().std().item(),
+                )
         else:
             # GPTQ v1 and v2 format checkpoints deals with zero points
             # differently, and require different gemm kernels.

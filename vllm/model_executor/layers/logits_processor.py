@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
+import logging
+
 import torch
 
 from vllm.distributed import (
@@ -11,6 +13,8 @@ from vllm.distributed import (
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.platforms import current_platform
+
+logger = logging.getLogger(__name__)
 
 
 # --8<-- [start:logits_processor]
@@ -50,6 +54,8 @@ class LogitsProcessor(CustomOp):
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
 
+    _logits_debug_count = 0
+
     def forward(
         self,
         lm_head: VocabParallelEmbedding,
@@ -69,6 +75,25 @@ class LogitsProcessor(CustomOp):
 
             if self.scale != 1.0:
                 logits *= self.scale
+
+            # Debug: log top token IDs for the first N forward passes
+            if LogitsProcessor._logits_debug_count < 40:
+                LogitsProcessor._logits_debug_count += 1
+                with torch.no_grad():
+                    topk = torch.topk(logits[-1], k=min(10, logits.size(-1)))
+                    logger.debug(
+                        "LogitsProcessor step %d: "
+                        "logits shape=%s, "
+                        "top10_ids=%s, top10_vals=%s, "
+                        "logits min=%.2f max=%.2f mean=%.2f",
+                        LogitsProcessor._logits_debug_count,
+                        list(logits.shape),
+                        topk.indices.tolist(),
+                        [f"{v:.2f}" for v in topk.values.tolist()],
+                        logits.float().min().item(),
+                        logits.float().max().item(),
+                        logits.float().mean().item(),
+                    )
         return logits
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
