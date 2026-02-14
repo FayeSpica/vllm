@@ -614,31 +614,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            # Debug: NaN detection in MQA decode path
-            if not hasattr(MLAAttention, '_mqa_debug_count'):
-                MLAAttention._mqa_debug_count = 0
-            if MLAAttention._mqa_debug_count < 10:
-                MLAAttention._mqa_debug_count += 1
-                with torch.no_grad():
-                    _q_nan = torch.isnan(mqa_q_nope).any().item()
-                    _ql_nan = torch.isnan(mqa_ql_nope).any().item()
-                    _pe_nan = torch.isnan(mqa_q_pe).any().item()
-                    _wuk_nan = torch.isnan(self.W_UK_T).any().item()
-                    _wuv_nan = torch.isnan(self.W_UV).any().item()
-                    _kv_nan = torch.isnan(kv_cache).any().item() if kv_cache.numel() > 0 else False
-                    logger.debug(
-                        "MQA decode NaN check step %d layer=%s: "
-                        "q_nope_nan=%s ql_nope_nan=%s q_pe_nan=%s "
-                        "W_UK_T_nan=%s W_UV_nan=%s kv_cache_nan=%s "
-                        "ql_nope min=%.4f max=%.4f",
-                        MLAAttention._mqa_debug_count,
-                        getattr(self, 'layer_name', '?'),
-                        _q_nan, _ql_nan, _pe_nan,
-                        _wuk_nan, _wuv_nan, _kv_nan,
-                        mqa_ql_nope.float().min().item(),
-                        mqa_ql_nope.float().max().item(),
-                    )
-
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
@@ -659,19 +634,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)
 
-            # Debug: NaN detection after decode attention and v_up_proj
-            if MLAAttention._mqa_debug_count <= 10:
-                with torch.no_grad():
-                    _attn_nan = torch.isnan(attn_out).any().item()
-                    logger.debug(
-                        "MQA decode after forward_mqa layer=%s: "
-                        "attn_out_nan=%s attn_out min=%.4f max=%.4f",
-                        getattr(self, 'layer_name', '?'),
-                        _attn_nan,
-                        attn_out.float().min().item(),
-                        attn_out.float().max().item(),
-                    )
-
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
                 attn_out = cp_lse_ag_out_rs(
@@ -683,19 +645,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # v_up projection
             self._v_up_proj(attn_out, out=mqa_output_slice)
-
-            # Debug: NaN detection after v_up_proj
-            if MLAAttention._mqa_debug_count <= 10:
-                with torch.no_grad():
-                    _vup_nan = torch.isnan(mqa_output_slice).any().item()
-                    logger.debug(
-                        "MQA decode after v_up_proj layer=%s: "
-                        "output_nan=%s output min=%.4f max=%.4f",
-                        getattr(self, 'layer_name', '?'),
-                        _vup_nan,
-                        mqa_output_slice.float().min().item(),
-                        mqa_output_slice.float().max().item(),
-                    )
         return output_padded
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):

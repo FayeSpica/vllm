@@ -21,17 +21,9 @@ from vllm.v1.attention.backend import (
     AttentionType,
     is_quantized_kv_cache,
 )
-from vllm.platforms import current_platform
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 logger = init_logger(__name__)
-
-# V100 (SM 7.0) flag: Triton MLA decode kernel produces NaN due to
-# tl.dot / softmax numerical issues on Volta.  Use PyTorch fallback.
-_USE_VOLTA_DECODE = (
-    current_platform.is_cuda()
-    and current_platform.get_device_capability() == (7, 0)
-)
 
 
 class TritonMLABackend(MLACommonBackend):
@@ -125,100 +117,6 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             **kwargs,
         )
 
-    _volta_debug_count = 0
-
-    def _volta_forward_mqa(
-        self,
-        q: torch.Tensor,
-        kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: MLACommonMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Pure PyTorch MLA decode attention for V100 (SM 7.0).
-
-        The Triton MLA decode kernel (_fwd_grouped_kernel_stage1/stage2)
-        produces NaN on Volta due to tl.dot numerical issues with
-        BLOCK_DMODEL=512.  This fallback uses PyTorch matmul + softmax
-        which is slower but numerically reliable.
-        """
-        B, H, D = q.shape
-        D_nope = self.kv_lora_rank
-        D_pe = D - D_nope
-
-        block_table = attn_metadata.decode.block_table
-        seq_lens = attn_metadata.decode.seq_lens
-        PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
-
-        # kv_c_and_k_pe_cache: [num_blocks, PAGE_SIZE, D]
-        kv_cache = kv_c_and_k_pe_cache
-
-        do_debug = TritonMLAImpl._volta_debug_count < 5
-        if do_debug:
-            TritonMLAImpl._volta_debug_count += 1
-            q_nan = torch.isnan(q).any().item()
-            kv_nan = torch.isnan(kv_cache).any().item()
-            logger.debug(
-                "Volta MQA step %d: B=%d H=%d D=%d D_nope=%d D_pe=%d "
-                "PAGE_SIZE=%d q_has_nan=%s kv_cache_has_nan=%s "
-                "q min=%.4f max=%.4f kv min=%.4f max=%.4f",
-                TritonMLAImpl._volta_debug_count, B, H, D, D_nope, D_pe,
-                PAGE_SIZE, q_nan, kv_nan,
-                q.float().min().item(), q.float().max().item(),
-                kv_cache.float().min().item(), kv_cache.float().max().item(),
-            )
-
-        o = torch.zeros(B, H, D_nope, dtype=q.dtype, device=q.device)
-        lse = torch.zeros(B, H, dtype=q.dtype, device=q.device)
-
-        for b in range(B):
-            sl = seq_lens[b].item()
-            if sl == 0:
-                continue
-
-            # Gather paged KV cache for this request
-            num_pages = (sl + PAGE_SIZE - 1) // PAGE_SIZE
-            pages = block_table[b, :num_pages]
-            kv = kv_cache[pages].reshape(-1, D)[:sl]  # [sl, D]
-
-            k_nope = kv[:, :D_nope]   # [sl, D_nope]
-            k_pe = kv[:, D_nope:]     # [sl, D_pe]
-            v = kv[:, :D_nope]        # [sl, D_nope]  (MLA: V = compressed KV)
-
-            q_b = q[b]               # [H, D]
-            q_nope = q_b[:, :D_nope]  # [H, D_nope]
-            q_pe = q_b[:, D_nope:]    # [H, D_pe]
-
-            # Compute in float32 for numerical stability
-            scores = (
-                torch.matmul(q_nope.float(), k_nope.float().T)
-                + torch.matmul(q_pe.float(), k_pe.float().T)
-            ) * self.scale  # [H, sl]
-
-            max_s = scores.max(dim=-1, keepdim=True).values
-            exp_s = torch.exp(scores - max_s)
-            sum_exp = exp_s.sum(dim=-1, keepdim=True)
-            attn_w = exp_s / sum_exp  # [H, sl]
-
-            o[b] = torch.matmul(attn_w, v.float()).to(q.dtype)  # [H, D_nope]
-            lse[b] = (max_s.squeeze(-1) + torch.log(
-                sum_exp.squeeze(-1))).to(q.dtype)
-
-            if do_debug and b == 0:
-                logger.debug(
-                    "  b=%d sl=%d scores_nan=%s scores min=%.4f max=%.4f "
-                    "attn_w_nan=%s o_nan=%s o min=%.4f max=%.4f "
-                    "kv_nan=%s kv min=%.4f max=%.4f",
-                    b, sl,
-                    torch.isnan(scores).any().item(),
-                    scores.min().item(), scores.max().item(),
-                    torch.isnan(attn_w).any().item(),
-                    torch.isnan(o[b]).any().item(),
-                    o[b].float().min().item(), o[b].float().max().item(),
-                    torch.isnan(kv).any().item(),
-                    kv.float().min().item(), kv.float().max().item(),
-                )
-
-        return o, lse
-
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -236,10 +134,6 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
-
-        if _USE_VOLTA_DECODE:
-            return self._volta_forward_mqa(
-                q, kv_c_and_k_pe_cache, attn_metadata)
 
         B = q.shape[0]
         q_num_heads = q.shape[1]

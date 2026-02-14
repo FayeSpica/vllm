@@ -173,8 +173,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
-    _layer_nan_debug_count = 0
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -198,27 +196,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-
-        # NaN debug: must guard with is_compiling() to avoid torch.dynamo error
-        if (not torch.compiler.is_compiling()
-                and Glm4MoeLiteDecoderLayer._layer_nan_debug_count < 3):
-            with torch.no_grad():
-                _hs_nan = torch.isnan(hidden_states).any().item()
-                _res_nan = torch.isnan(residual).any().item()
-                if _hs_nan or _res_nan:
-                    logger.debug(
-                        "Layer %d: NaN detected! "
-                        "hidden_nan=%s residual_nan=%s",
-                        self.layer_idx, _hs_nan, _res_nan,
-                    )
-                if self.layer_idx == 0:
-                    Glm4MoeLiteDecoderLayer._layer_nan_debug_count += 1
-                    logger.debug(
-                        "Layer 0 check #%d: "
-                        "hidden_nan=%s residual_nan=%s",
-                        Glm4MoeLiteDecoderLayer._layer_nan_debug_count,
-                        _hs_nan, _res_nan,
-                    )
 
         return hidden_states, residual
 

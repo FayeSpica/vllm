@@ -463,13 +463,6 @@ def _decode_grouped_att_m_fwd(
         # exceeding the hardware limit.  Reduce to 1 stage.
         num_stages = 1
 
-    logger.debug(
-        "MLA decode grouped: BLOCK=%d, BLOCK_DMODEL=%d, BLOCK_DPE=%d, "
-        "BLOCK_DV=%d, num_stages=%d, capability=%s",
-        BLOCK, BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, num_stages,
-        current_platform.get_device_capability(),
-    )
-
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,

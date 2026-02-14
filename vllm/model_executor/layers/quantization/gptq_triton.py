@@ -43,9 +43,9 @@ def gptq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    accumulator_dtype = c_ptr.type.element_ty
+    input_dtype = a_ptr.type.element_ty
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N),
-                           dtype=accumulator_dtype)
+                           dtype=tl.float32)
 
     # Offsets and masks for input A [M, K]
     offsets_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -85,7 +85,7 @@ def gptq_gemm_kernel(
         # quantization. GPTQ uses bias of 8, so subtract 8 to get signed
         # range.
         b_qweight = b_qweight.to(tl.int8) - 8
-        b_qweight = b_qweight.to(accumulator_dtype)
+        b_qweight = b_qweight.to(input_dtype)
 
         # Load and apply scales
         # Scales are per group, compute which group each K element belongs to
@@ -103,7 +103,7 @@ def gptq_gemm_kernel(
 
         # Accumulate results
         accumulator = tl.dot(a, b_qweight, accumulator,
-                             out_dtype=accumulator_dtype)
+                             out_dtype=tl.float32)
 
         offsets_k += BLOCK_SIZE_K * SPLIT_K
         a_ptrs += BLOCK_SIZE_K * SPLIT_K
