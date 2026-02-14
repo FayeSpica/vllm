@@ -182,26 +182,12 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        do_nan_check = Glm4MoeLiteDecoderLayer._layer_nan_debug_count < 3
-
         # Self Attention
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        if do_nan_check and self.layer_idx == 0:
-            with torch.no_grad():
-                _in_nan = torch.isnan(hidden_states).any().item()
-                if _in_nan:
-                    logger.debug(
-                        "Layer %d: input to attn has NaN! "
-                        "hidden min=%.4f max=%.4f",
-                        self.layer_idx,
-                        hidden_states.float().min().item(),
-                        hidden_states.float().max().item(),
-                    )
 
         attn_kwargs = {
             "positions": positions,
@@ -210,42 +196,28 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         attn_kwargs["llama_4_scaling"] = llama_4_scaling
         hidden_states = self.self_attn(**attn_kwargs)
 
-        if do_nan_check:
-            with torch.no_grad():
-                _attn_nan = torch.isnan(hidden_states).any().item()
-                if _attn_nan:
-                    logger.debug(
-                        "Layer %d: ATTN output has NaN! "
-                        "shape=%s min=%.4f max=%.4f",
-                        self.layer_idx, list(hidden_states.shape),
-                        hidden_states.float().min().item(),
-                        hidden_states.float().max().item(),
-                    )
-
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
-        if do_nan_check:
+        # NaN debug: must guard with is_compiling() to avoid torch.dynamo error
+        if (not torch.compiler.is_compiling()
+                and Glm4MoeLiteDecoderLayer._layer_nan_debug_count < 3):
             with torch.no_grad():
-                _mlp_nan = torch.isnan(hidden_states).any().item()
+                _hs_nan = torch.isnan(hidden_states).any().item()
                 _res_nan = torch.isnan(residual).any().item()
-                if _mlp_nan or _res_nan:
+                if _hs_nan or _res_nan:
                     logger.debug(
-                        "Layer %d: MLP output has NaN! "
+                        "Layer %d: NaN detected! "
                         "hidden_nan=%s residual_nan=%s",
-                        self.layer_idx, _mlp_nan, _res_nan,
+                        self.layer_idx, _hs_nan, _res_nan,
                     )
-                # For layer 0, always log to confirm decode is running
                 if self.layer_idx == 0:
                     Glm4MoeLiteDecoderLayer._layer_nan_debug_count += 1
                     logger.debug(
-                        "Layer 0 decode check #%d: "
-                        "hidden_nan=%s residual_nan=%s "
-                        "hidden min=%.4f max=%.4f",
+                        "Layer 0 check #%d: "
+                        "hidden_nan=%s residual_nan=%s",
                         Glm4MoeLiteDecoderLayer._layer_nan_debug_count,
-                        _mlp_nan, _res_nan,
-                        hidden_states.float().min().item(),
-                        hidden_states.float().max().item(),
+                        _hs_nan, _res_nan,
                     )
 
         return hidden_states, residual
