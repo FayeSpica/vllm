@@ -842,29 +842,6 @@ class VllmConfig:
             else:
                 self.compilation_config.cudagraph_num_of_warmups = 1
 
-            # Disable CUDA graphs on V100 (SM 7.0) with GPTQ MoE.
-            # The sequential per-expert dispatch used to work around a
-            # Triton codegen bug on Volta uses .item() and data-dependent
-            # Python control flow, which is incompatible with CUDA graph
-            # capture (including piecewise capture).
-            if (
-                self.model_config is not None
-                and self.model_config.is_moe
-                and self.model_config.quantization == "gptq"
-                and current_platform.is_cuda()
-                and current_platform.get_device_capability() == (7, 0)
-                and self.compilation_config.cudagraph_mode
-                != CUDAGraphMode.NONE
-            ):
-                logger.warning(
-                    "Disabling CUDA graphs for GPTQ MoE on V100 (SM 7.0). "
-                    "The sequential MoE dispatch is incompatible with "
-                    "CUDA graph capture."
-                )
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                self.compilation_config.max_cudagraph_capture_size = 0
-                self.compilation_config.cudagraph_capture_sizes = []
-
             self._set_cudagraph_sizes()
         else:
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
