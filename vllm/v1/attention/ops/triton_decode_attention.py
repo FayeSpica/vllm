@@ -424,6 +424,10 @@ def _decode_grouped_att_m_fwd(
     # [TODO] work around shmem limit on MI3xx
     if is_hip_ and Lk >= 576:
         BLOCK = 16
+    elif current_platform.get_device_capability() == (7, 0) and Lk >= 576:
+        # V100 (SM 7.0) has only 96 KB shared memory — same constraint
+        # as MI3xx.  Halve BLOCK_N to reduce pipelined shared memory.
+        BLOCK = 16
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -459,6 +463,13 @@ def _decode_grouped_att_m_fwd(
         # requires ~100 KB for MLA decode (BLOCK_DMODEL=512 etc.),
         # exceeding the hardware limit.  Reduce to 1 stage.
         num_stages = 1
+
+    logger.debug(
+        "MLA decode grouped: BLOCK=%d, BLOCK_DMODEL=%d, BLOCK_DPE=%d, "
+        "BLOCK_DV=%d, num_stages=%d, capability=%s",
+        BLOCK, BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, num_stages,
+        current_platform.get_device_capability(),
+    )
 
     _fwd_grouped_kernel_stage1[grid](
         q,
