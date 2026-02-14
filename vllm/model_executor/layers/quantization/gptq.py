@@ -235,6 +235,17 @@ class GPTQLinearMethod(LinearMethodBase):
         # GPTQ v1 and v2 format deals with zero points differently
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
+        # On V100 (SM 7.0), the ExLlama-based gptq_gemm 4-bit kernel is
+        # buggy and Marlin requires SM 75+.  Use the Triton GPTQ kernel
+        # instead, which supports SM >= 7.0 with symmetric 4-bit quant.
+        from vllm.platforms import current_platform
+
+        self.use_triton_gptq = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and quant_config.weight_bits == 4
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -365,7 +376,13 @@ class GPTQLinearMethod(LinearMethodBase):
                     (0,), dtype=torch.int, device=layer.g_idx.device
                 )
             layer.exllama_state = ExllamaState.READY
-            ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+            if not self.use_triton_gptq:
+                # ExLlama kernel requires a bit-level shuffle of qweight.
+                # The Triton GPTQ kernel expects original GPTQ packing, so
+                # skip the shuffle on V100.
+                ops.gptq_shuffle(
+                    layer.qweight, layer.g_idx,
+                    self.quant_config.weight_bits)
 
     def apply(
         self,
@@ -376,18 +393,32 @@ class GPTQLinearMethod(LinearMethodBase):
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        # GPTQ v1 and v2 format checkpoints deals with zero points differently,
-        # and require different gemm kernels.
-        output = ops.gptq_gemm(
-            reshaped_x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            layer.g_idx,
-            layer.exllama_state == ExllamaState.READY,
-            self.use_v2_format,
-            self.quant_config.weight_bits,
-        )
+        if self.use_triton_gptq:
+            # Triton GPTQ kernel for V100: works with original GPTQ
+            # packing (no gptq_shuffle needed), symmetric 4-bit only.
+            from vllm.model_executor.layers.quantization.gptq_triton import (
+                gptq_gemm_triton,
+            )
+
+            output = gptq_gemm_triton(
+                reshaped_x,
+                layer.qweight,
+                layer.scales,
+                self.quant_config.group_size,
+            )
+        else:
+            # GPTQ v1 and v2 format checkpoints deals with zero points
+            # differently, and require different gemm kernels.
+            output = ops.gptq_gemm(
+                reshaped_x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                layer.g_idx,
+                layer.exllama_state == ExllamaState.READY,
+                self.use_v2_format,
+                self.quant_config.weight_bits,
+            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)

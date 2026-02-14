@@ -29,16 +29,15 @@ Memory-efficient attention for decoding.
 It supports page size >= 1.
 """
 
-import logging
-
 from packaging import version
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 is_hip_ = current_platform.is_rocm()
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 # Only print the following warnings when triton version < 3.2.0.
 # The issue won't affect performance or accuracy.
