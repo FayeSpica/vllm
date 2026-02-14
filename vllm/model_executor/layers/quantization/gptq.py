@@ -384,6 +384,49 @@ class GPTQLinearMethod(LinearMethodBase):
                     layer.qweight, layer.g_idx,
                     self.quant_config.weight_bits)
 
+    @staticmethod
+    def _dequantize_gptq_4bit(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> torch.Tensor:
+        """Dequantize GPTQ 4-bit symmetric weights using pure PyTorch.
+
+        Used on V100 (SM 7.0) where the ExLlama gptq_gemm 4-bit kernel
+        is buggy and Marlin requires SM 75+.  Pure PyTorch operations
+        are slower but numerically reliable on all CUDA architectures.
+
+        Args:
+            qweight: Packed weights [K // 8, N], int32.
+            scales: Per-group scales [K // group_size, N], float16.
+            group_size: Quantization group size (e.g. 128).
+
+        Returns:
+            Dequantized weight matrix [K, N], float16.
+        """
+        K_packed, N = qweight.shape
+        K = K_packed * 8
+
+        # Unpack 8 int4 values from each int32
+        # shifts: [0, 4, 8, 12, 16, 20, 24, 28]
+        shifts = torch.arange(
+            0, 32, 4, device=qweight.device, dtype=torch.int32
+        )
+        # [K_packed, 1, N] >> [1, 8, 1] -> [K_packed, 8, N]
+        unpacked = (qweight.unsqueeze(1) >> shifts.reshape(1, 8, 1)) & 0xF
+        # Reshape to [K, N] – nibble j of packed row i becomes row i*8+j
+        unpacked = unpacked.reshape(K, N)
+
+        # Symmetric dequant: (uint4 - 8) * scale
+        weight = (unpacked.to(torch.int8) - 8).to(scales.dtype)
+
+        # Apply per-group scales: [K // group_size, N] -> [K, N]
+        effective_gs = group_size if group_size != -1 else K
+        scales_expanded = scales.repeat_interleave(effective_gs, dim=0)[:K]
+        weight = weight * scales_expanded
+
+        return weight
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -394,18 +437,17 @@ class GPTQLinearMethod(LinearMethodBase):
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         if self.use_triton_gptq:
-            # Triton GPTQ kernel for V100: works with original GPTQ
-            # packing (no gptq_shuffle needed), symmetric 4-bit only.
-            from vllm.model_executor.layers.quantization.gptq_triton import (
-                gptq_gemm_triton,
-            )
-
-            output = gptq_gemm_triton(
-                reshaped_x,
+            # Pure PyTorch dequantization for V100 (SM 7.0):
+            # the ExLlama gptq_gemm 4-bit kernel is buggy and the Triton
+            # GPTQ kernel has Volta-specific numerical issues.  Manual
+            # dequant + torch.matmul is slower but reliable (same strategy
+            # as _volta_sequential_moe_int4 for MoE layers).
+            weight_fp16 = self._dequantize_gptq_4bit(
                 layer.qweight,
                 layer.scales,
                 self.quant_config.group_size,
             )
+            output = torch.matmul(reshaped_x, weight_fp16)
         else:
             # GPTQ v1 and v2 format checkpoints deals with zero points
             # differently, and require different gemm kernels.
