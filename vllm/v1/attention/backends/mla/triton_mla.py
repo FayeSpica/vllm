@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from typing import ClassVar
 
 import torch
@@ -27,14 +26,12 @@ from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 logger = init_logger(__name__)
 
-# V100 (SM 7.0): Triton MLA decode kernel may OOM on launch if VRAM
-# is fully occupied.  Use --gpu-memory-utilization 0.85 to leave room
-# for Triton JIT compilation buffers.  Set VLLM_V100_MLA_FALLBACK=1
-# to force PyTorch fallback if the Triton kernel still OOMs.
+# V100 (SM 7.0): The Triton MLA decode kernel crashes with
+# "illegal memory access" on SM 7.0 — not just OOM but a
+# fundamental incompatibility.  Always use PyTorch fallback.
 _USE_VOLTA_DECODE = (
     current_platform.is_cuda()
     and current_platform.get_device_capability() == (7, 0)
-    and os.environ.get("VLLM_V100_MLA_FALLBACK", "0") == "1"
 )
 
 
