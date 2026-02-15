@@ -59,7 +59,7 @@ def _volta_mla_decode_kernel(
     # V dimension offsets (D_NOPE is power of 2, e.g. 512)
     offs_v = tl.arange(0, D_NOPE)
 
-    # Online softmax state
+    # Online softmax state as [1] tensors (Triton has no true scalars)
     m_i = tl.full([1], float('-inf'), dtype=tl.float32)
     l_i = tl.zeros([1], dtype=tl.float32)
     acc = tl.zeros([D_NOPE], dtype=tl.float32)
@@ -131,8 +131,10 @@ def _volta_mla_decode_kernel(
     tl.store(o_base + offs_v, acc.to(O.dtype.element_ty))
 
     # Store log-sum-exp (scalar per batch,head)
-    lse_val = m_i + tl.log(l_i)
-    tl.store(LSE + pid_b * H + pid_h, lse_val.to(LSE.dtype.element_ty))
+    # m_i and l_i are [1] tensors, so use a [1] block pointer to match
+    lse_val = (m_i + tl.log(l_i)).to(LSE.dtype.element_ty)
+    lse_ptrs = LSE + pid_b * H + pid_h + tl.arange(0, 1)
+    tl.store(lse_ptrs, lse_val)
 
 
 def volta_mla_decode_fwd(
