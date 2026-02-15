@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import ClassVar
 
 import torch
@@ -26,12 +27,16 @@ from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 logger = init_logger(__name__)
 
-# V100 (SM 7.0): The Triton MLA decode kernel crashes with
-# "illegal memory access" on SM 7.0 — not just OOM but a
-# fundamental incompatibility.  Always use PyTorch fallback.
+# V100 (SM 7.0): The standard Triton MLA decode kernel crashes with
+# "illegal memory access" on SM 7.0.  Use a V100-specific simplified
+# Triton kernel instead.  Set VLLM_V100_MLA_PYTORCH=1 to fall back
+# to the PyTorch batched-matmul implementation if issues arise.
 _USE_VOLTA_DECODE = (
     current_platform.is_cuda()
     and current_platform.get_device_capability() == (7, 0)
+)
+_VOLTA_USE_PYTORCH = (
+    os.environ.get("VLLM_V100_MLA_PYTORCH", "0") == "1"
 )
 
 
@@ -186,6 +191,37 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         return o, lse
 
+    def _volta_triton_forward_mqa(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """V100-specific Triton MLA decode kernel.
+
+        Uses a simplified kernel with D-tiling and conservative block sizes
+        that avoids the illegal memory access on SM 7.0.
+        """
+        from vllm.v1.attention.ops.volta_mla_decode import volta_mla_decode_fwd
+
+        B = q.shape[0]
+        H = q.shape[1]
+        PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
+
+        o = torch.zeros(
+            B, H, self.kv_lora_rank, dtype=q.dtype, device=q.device)
+        lse = torch.full(
+            (B, H), float('-inf'), dtype=q.dtype, device=q.device)
+
+        volta_mla_decode_fwd(
+            q, kv_c_and_k_pe_cache, o, lse,
+            attn_metadata.decode.block_table,
+            attn_metadata.decode.seq_lens,
+            self.scale,
+            PAGE_SIZE,
+        )
+        return o, lse
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -205,7 +241,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert isinstance(q, torch.Tensor)
 
         if _USE_VOLTA_DECODE:
-            return self._volta_forward_mqa(
+            if _VOLTA_USE_PYTORCH:
+                return self._volta_forward_mqa(
+                    q, kv_c_and_k_pe_cache, attn_metadata)
+            return self._volta_triton_forward_mqa(
                 q, kv_c_and_k_pe_cache, attn_metadata)
 
         B = q.shape[0]
