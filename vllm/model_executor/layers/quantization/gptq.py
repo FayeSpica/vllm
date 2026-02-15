@@ -235,15 +235,24 @@ class GPTQLinearMethod(LinearMethodBase):
         # GPTQ v1 and v2 format deals with zero points differently
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
 
-        # On V100 (SM 7.0), the ExLlama-based gptq_gemm 4-bit kernel is
-        # buggy and Marlin requires SM 75+.  Use the Triton GPTQ kernel
-        # instead, which supports SM >= 7.0 with symmetric 4-bit quant.
+        # On V100 (SM 7.0), Marlin requires SM 75+.  Default to the
+        # Triton GPTQ kernel for symmetric 4-bit quant.
+        # Set VLLM_V100_GPTQ_EXLLAMA=1 to use the ExLlama CUDA kernel
+        # instead (required for CUDA graph compatibility).
+        import os
         from vllm.platforms import current_platform
 
-        self.use_triton_gptq = (
+        _is_v100 = (
             current_platform.is_cuda()
             and current_platform.get_device_capability() == (7, 0)
+        )
+        _use_exllama = (
+            os.environ.get("VLLM_V100_GPTQ_EXLLAMA", "0") == "1"
+        )
+        self.use_triton_gptq = (
+            _is_v100
             and quant_config.weight_bits == 4
+            and not _use_exllama
         )
 
     def create_weights(
