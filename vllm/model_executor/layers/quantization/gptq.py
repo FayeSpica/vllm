@@ -237,22 +237,12 @@ class GPTQLinearMethod(LinearMethodBase):
 
         # On V100 (SM 7.0), Marlin requires SM 75+.  Default to the
         # Triton GPTQ kernel for symmetric 4-bit quant.
-        # Set VLLM_V100_GPTQ_EXLLAMA=1 to use the ExLlama CUDA kernel
-        # instead (required for CUDA graph compatibility).
-        import os
         from vllm.platforms import current_platform
 
-        _is_v100 = (
+        self.use_triton_gptq = (
             current_platform.is_cuda()
             and current_platform.get_device_capability() == (7, 0)
-        )
-        _use_exllama = (
-            os.environ.get("VLLM_V100_GPTQ_EXLLAMA", "0") == "1"
-        )
-        self.use_triton_gptq = (
-            _is_v100
             and quant_config.weight_bits == 4
-            and not _use_exllama
         )
 
     def create_weights(

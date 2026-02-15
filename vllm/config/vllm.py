@@ -842,51 +842,26 @@ class VllmConfig:
             else:
                 self.compilation_config.cudagraph_num_of_warmups = 1
 
-            # V100 (SM 7.0) + GPTQ MoE: Triton kernels inside CUDA graphs
-            # produce corrupted output.  By default disable CUDA graphs.
-            # Set VLLM_V100_CUDA_GRAPH=1 (with VLLM_V100_GPTQ_EXLLAMA=1)
-            # to use PIECEWISE mode with MoE as extra split points, so
-            # only CUDA-native ops remain inside graph regions.
-            import os
-            self._v100_gptq_moe = (
+            # V100 (SM 7.0) + GPTQ MoE: Triton kernels (GPTQ dequant,
+            # fused MoE) produce corrupted output inside CUDA graphs,
+            # and crash with illegal memory access when used as PIECEWISE
+            # split points.  Disable CUDA graphs entirely.
+            if (
                 self.model_config is not None
                 and self.model_config.is_moe
                 and self.model_config.quantization == "gptq"
                 and current_platform.is_cuda()
                 and current_platform.get_device_capability() == (7, 0)
-            )
-            self._v100_cuda_graph = (
-                os.environ.get("VLLM_V100_CUDA_GRAPH", "0") == "1"
-            )
-            if self._v100_gptq_moe and not self._v100_cuda_graph:
-                if (self.compilation_config.cudagraph_mode
-                        != CUDAGraphMode.NONE):
-                    logger.warning(
-                        "Disabling CUDA graphs for GPTQ MoE on V100 "
-                        "(SM 7.0). Set VLLM_V100_CUDA_GRAPH=1 with "
-                        "VLLM_V100_GPTQ_EXLLAMA=1 to enable PIECEWISE."
-                    )
-                    self.compilation_config.cudagraph_mode = (
-                        CUDAGraphMode.NONE)
-                    self.compilation_config.max_cudagraph_capture_size = 0
-                    self.compilation_config.cudagraph_capture_sizes = []
-            elif self._v100_gptq_moe and self._v100_cuda_graph:
-                _use_exllama = (
-                    os.environ.get("VLLM_V100_GPTQ_EXLLAMA", "0") == "1"
+                and self.compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE
+            ):
+                logger.warning(
+                    "Disabling CUDA graphs for GPTQ MoE on V100 (SM 7.0) "
+                    "to avoid corrupted output with Triton kernels."
                 )
-                if not _use_exllama:
-                    logger.warning(
-                        "VLLM_V100_CUDA_GRAPH=1 requires "
-                        "VLLM_V100_GPTQ_EXLLAMA=1 to avoid Triton GPTQ "
-                        "kernels inside graph regions. Setting it now."
-                    )
-                    os.environ["VLLM_V100_GPTQ_EXLLAMA"] = "1"
-                logger.info(
-                    "V100 CUDA graph mode enabled: using PIECEWISE with "
-                    "MoE ops as extra split points."
-                )
-                self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.PIECEWISE)
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                self.compilation_config.max_cudagraph_capture_size = 0
+                self.compilation_config.cudagraph_capture_sizes = []
 
             self._set_cudagraph_sizes()
         else:
@@ -981,14 +956,6 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
-
-        # V100 CUDA graph PIECEWISE: add MoE ops as extra split points
-        # so Triton MoE kernels run outside graph regions.
-        if getattr(self, '_v100_gptq_moe', False) and getattr(self, '_v100_cuda_graph', False):
-            moe_ops = ["vllm::moe_forward", "vllm::moe_forward_shared"]
-            for op in moe_ops:
-                if op not in self.compilation_config.splitting_ops:
-                    self.compilation_config.splitting_ops.append(op)
 
         if self.compilation_config.pass_config.enable_sp:
             # With pipeline parallelism or dynamo partitioning,
