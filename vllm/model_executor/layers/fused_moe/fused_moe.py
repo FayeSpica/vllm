@@ -256,10 +256,13 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        if use_fp16_accumulation:
-            # On V100: use masked load for safety
-            b_k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
-            b = tl.load(b_ptrs, mask=b_k_mask, other=0)
+        if not block_k_diviable:
+            # Mask B loads when K is not divisible by BLOCK_SIZE_K to
+            # prevent out-of-bounds access.  On V100 (SM70) we also
+            # force block_k_diviable=False in the launcher so that
+            # all loads are masked, providing extra safety against
+            # Triton codegen issues on Volta.
+            b = tl.load(b_ptrs, mask=k_mask, other=0)
         else:
             b = tl.load(b_ptrs)
         if use_int4_w4a16:
@@ -743,7 +746,12 @@ def invoke_fused_moe_wna16_triton_kernel(
         B_zp.stride(0) if B_zp is not None else 0,
         B_zp.stride(2) if B_zp is not None else 0,
         B_zp.stride(1) if B_zp is not None else 0,
-        block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
+        # On V100 (SM70) force masked loads for all B/scale/zp
+        # accesses to work around Triton codegen issues on Volta.
+        block_k_diviable=(
+            A.size(1) % config["BLOCK_SIZE_K"] == 0
+            and not _is_volta()
+        ),
         group_size=block_shape[1],
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
@@ -1196,13 +1204,7 @@ def get_moe_wna16_block_config(
         return {}
     if not use_moe_wna16_cuda:
         # triton moe wna16 kernel
-        capability = current_platform.get_device_capability()
-        is_volta = (
-            current_platform.is_cuda()
-            and capability is not None
-            and capability == (7, 0)
-        )
-        if is_volta:
+        if _is_volta():
             # Volta (SM70): minimal block sizes required for Triton
             # codegen stability.  Larger blocks cause illegal memory
             # access on SM 7.0.
@@ -1265,6 +1267,16 @@ def get_moe_wna16_block_config(
         block_size_k = _ensure_block_size_k_divisible(size_k, block_size_k, group_size)
 
         return {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k}
+
+
+def _is_volta() -> bool:
+    """Return True when running on V100 / SM 7.0 (Volta)."""
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_cuda()
+        and capability is not None
+        and capability == (7, 0)
+    )
 
 
 def should_moe_wna16_use_cuda(
