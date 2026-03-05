@@ -165,6 +165,36 @@ class CudaPlatformBase(Platform):
         pass
 
     @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.config.compilation import CUDAGraphMode
+
+        # Volta (SM 7.0): Triton kernels inside CUDA graph replay produce
+        # illegal memory access.  Disable CUDA graphs entirely when the
+        # model uses quantized MoE (GPTQ/AWQ), which routes to the
+        # fused_moe_kernel_gptq_awq Triton kernel.
+        capability = cls.get_device_capability()
+        model_config = vllm_config.model_config
+        if (
+            capability is not None
+            and capability == (7, 0)
+            and model_config is not None
+            and model_config.is_moe
+            and model_config.quantization is not None
+        ):
+            compilation_config = vllm_config.compilation_config
+            if (
+                compilation_config.cudagraph_mode is None
+                or compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE
+            ):
+                logger.warning(
+                    "V100 (SM 7.0) detected with quantized MoE model. "
+                    "Disabling CUDA graphs to avoid illegal memory access "
+                    "from Triton kernel replay on Volta."
+                )
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
