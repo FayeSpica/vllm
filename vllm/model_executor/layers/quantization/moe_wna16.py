@@ -68,12 +68,15 @@ class MoeWNA16Config(QuantizationConfig):
             device_capability = (
                 -1 if capability_tuple is None else capability_tuple.to_int()
             )
-            awq_min_capability = AWQConfig.get_min_capability()
-            if device_capability < awq_min_capability:
+            # AWQ CUDA kernels require Turing+ (SM 75), but the Triton
+            # fallback path (fused_moe_kernel_gptq_v100) supports Volta
+            # (SM 70) for INT4 MoE with zero points.
+            moe_wna16_min_capability = self.get_min_capability()
+            if device_capability < moe_wna16_min_capability:
                 raise ValueError(
                     "The quantization method moe_wna16 + awq is not supported "
                     "for the current GPU. "
-                    f"Minimum capability: {awq_min_capability}. "
+                    f"Minimum capability: {moe_wna16_min_capability}. "
                     f"Current capability: {device_capability}."
                 )
             self.use_marlin = AWQMarlinConfig.is_awq_marlin_compatible(full_config)
@@ -148,16 +151,16 @@ class MoeWNA16Config(QuantizationConfig):
         device_capability = (
             -1 if capability_tuple is None else capability_tuple.to_int()
         )
-        # Avoid circular import
-        from vllm.model_executor.layers.quantization.awq import AWQConfig
 
-        awq_min_capability = AWQConfig.get_min_capability()
+        # AWQ MoE uses the Triton fallback path which supports SM 70+
+        # (Volta), not the AWQ CUDA kernels which require SM 75+ (Turing).
+        moe_wna16_min_capability = cls.get_min_capability()
 
         gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
         awq_compatible = (
             quant_method == "awq"
             and num_bits == 4
-            and device_capability >= awq_min_capability
+            and device_capability >= moe_wna16_min_capability
         )
 
         return gptq_compatible or awq_compatible
