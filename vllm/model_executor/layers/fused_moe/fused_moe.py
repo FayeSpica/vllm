@@ -964,29 +964,6 @@ def invoke_fused_moe_wna16_v100_kernel(
         * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
     )
 
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.warning(
-        "V100 MoE kernel launch: "
-        "A=%s(%s) B=%s(%s) C=%s(%s) "
-        "B_scale=%s(%s) B_zp=%s(%s) "
-        "sorted_ids=%s expert_ids=%s "
-        "N=%d K=%d EM=%d num_tokens=%d top_k=%d "
-        "group_size=%d has_zp=%s mul_routed=%s "
-        "A.strides=%s B.strides=%s C.strides=%s "
-        "B_scale.strides=%s B_zp.strides=%s",
-        A.shape, A.dtype, B.shape, B.dtype, C.shape, C.dtype,
-        B_scale.shape, B_scale.dtype,
-        B_zp.shape if B_zp is not None else None,
-        B_zp.dtype if B_zp is not None else None,
-        sorted_token_ids.shape, expert_ids.shape,
-        B.size(1), A.size(1), EM, num_tokens, top_k,
-        block_shape[1], B_zp is not None, mul_routed_weight,
-        A.stride(), B.stride(), C.stride(),
-        B_scale.stride(),
-        B_zp.stride() if B_zp is not None else None,
-    )
-
     fused_moe_kernel_gptq_v100[grid](
         A,
         B,
@@ -1173,26 +1150,6 @@ def dispatch_fused_moe_kernel(
         block_shape is not None and block_shape[1] > 0
     ):
         assert B_bias is None
-
-        # V100 INT4: use dedicated Triton kernel before CUDA dispatch,
-        # because the CUDA WNA16 kernel is not supported on SM 7.0.
-        if _is_volta() and use_int4_w4a16:
-            invoke_fused_moe_wna16_v100_kernel(
-                A,
-                B,
-                C,
-                B_scale,
-                B_zp,
-                topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                mul_routed_weight,
-                top_k,
-                compute_type,
-                block_shape,
-            )
-            return
 
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
@@ -1481,14 +1438,28 @@ def get_moe_wna16_block_config(
     if not use_moe_wna16_cuda:
         # triton moe wna16 kernel
         if _is_volta():
-            # Volta (SM70): minimal block sizes required for Triton
-            # codegen stability.  Larger blocks cause illegal memory
-            # access on SM 7.0.
+            # Volta tuning derived from benchmarks (int4), matching
+            # PR #32597 approach.
+            m = max(1, num_valid_tokens // max(1, real_top_k))
+            if m <= 1:
+                return {
+                    "BLOCK_SIZE_N": 64,
+                    "BLOCK_SIZE_K": 32,
+                    "num_warps": 4,
+                    "num_stages": 1,
+                }
+            if m <= 2:
+                return {
+                    "BLOCK_SIZE_N": 32,
+                    "BLOCK_SIZE_K": 32,
+                    "num_warps": 2,
+                    "num_stages": 1,
+                }
             return {
                 "BLOCK_SIZE_N": 32,
                 "BLOCK_SIZE_K": 32,
                 "num_warps": 2,
-                "num_stages": 1,
+                "num_stages": 2,
             }
         if num_valid_tokens // real_top_k == 1:
             # if bs=1, use a smaller BLOCK_SIZE_N
@@ -1558,8 +1529,13 @@ def _is_volta() -> bool:
 def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
+    # CUDA WNA16 MoE kernel requires SM75+ (Turing and later).
+    # Volta (SM70) falls back to the Triton kernel.
+    capability = current_platform.get_device_capability()
     return (
         current_platform.is_cuda()
+        and capability is not None
+        and capability >= (7, 5)
         and bit == 4
         and group_size in [32, 64, 128]
         and num_valid_tokens / num_experts <= 6
@@ -1609,7 +1585,7 @@ def get_default_config(
         bit = 4 if dtype == "int4_w4a16" else 8
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(M * topk, block_shape[1], E, bit)
         if _is_volta() and bit == 4:
-            # V100 uses fused_moe_kernel_gptq_v100 with fixed BLOCK_SIZE_M=16.
+            # V100 uses fused_moe_kernel_gptq_awq with BLOCK_SIZE_M=16.
             # moe_align_block_size must use the same value so that
             # sorted_token_ids / expert_ids are compatible with the kernel.
             config = {"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
