@@ -1584,7 +1584,12 @@ def get_default_config(
         # BLOCK_SIZE_N and BLOCK_SIZE_K would be set later
         bit = 4 if dtype == "int4_w4a16" else 8
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(M * topk, block_shape[1], E, bit)
-        if use_moe_wna16_cuda:
+        if _is_volta() and bit == 4:
+            # V100 uses fused_moe_kernel_gptq_v100 with fixed BLOCK_SIZE_M=16.
+            # moe_align_block_size must use the same value so that
+            # sorted_token_ids / expert_ids are compatible with the kernel.
+            config = {"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
+        elif use_moe_wna16_cuda:
             config = {"BLOCK_SIZE_M": min(16, M), "SPLIT_K": 1}
         elif M <= 20:
             config = {"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
