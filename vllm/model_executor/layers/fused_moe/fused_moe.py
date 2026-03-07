@@ -483,8 +483,9 @@ def fused_moe_kernel_gptq_v100(
         else:
             b = ((b.to(tl.float32) - 8) * b_scale).to(compute_type)
 
-        # AWQ-proven tl.dot positional pattern for Volta PTX compat.
-        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32)
+        # Use keyword acc= pattern matching fused_moe_kernel_gptq_awq
+        # (positional + out_dtype generates invalid PTX on Volta).
+        accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance pointers.
         a_ptrs += BLOCK_SIZE_K * stride_ak
