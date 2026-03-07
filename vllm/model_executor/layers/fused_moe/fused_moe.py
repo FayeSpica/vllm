@@ -237,19 +237,13 @@ def fused_moe_kernel_gptq_awq(
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
 
-        if not block_k_diviable:
-            k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
-            k_other = 0.0
-        else:
-            k_mask = None
-            k_other = None
-
+        k_remaining_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
         a = tl.load(
             a_ptrs,
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs)
+        b = tl.load(b_ptrs, mask=k_remaining_mask, other=0.0)
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
@@ -259,7 +253,7 @@ def fused_moe_kernel_gptq_awq(
             + offs_bn[None, :] * stride_bsn
             + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
         )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+        b_scale = tl.load(b_scale_ptrs, mask=k_remaining_mask, other=0.0)
         b_scale = b_scale.to(tl.float32)
 
         if has_zp and use_int4_w4a16:
@@ -270,7 +264,7 @@ def fused_moe_kernel_gptq_awq(
                 + (offs_bn[None, :] // 2) * stride_bzn
                 + offs_k_true * stride_bzk
             )
-            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = tl.load(b_zp_ptrs, mask=k_remaining_mask, other=0.0)
             b_zp = (b_zp >> b_zp_shifter) & 0xF
             b_zp = b_zp.to(tl.float32)
         elif has_zp and use_int8_w8a16:
@@ -281,7 +275,7 @@ def fused_moe_kernel_gptq_awq(
                 + offs_bn[None, :] * stride_bzn
                 + offs_k_true * stride_bzk
             )
-            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = tl.load(b_zp_ptrs, mask=k_remaining_mask, other=0.0)
             b_zp = b_zp.to(tl.float32)
 
         # We accumulate along the K dimension.
