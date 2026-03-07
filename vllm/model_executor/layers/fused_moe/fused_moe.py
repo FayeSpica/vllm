@@ -178,6 +178,11 @@ def fused_moe_kernel_gptq_awq(
     # Cast to int64 to prevent overflow in stride*offset products
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
     token_mask = offs_token < num_valid_tokens
+    # Clamp padding tokens to index 0 so that pointer arithmetic never
+    # produces wild addresses.  Results for clamped lanes are masked out
+    # on store, so correctness is preserved.  This is critical on Volta
+    # (SM 7.0) where predicated loads may still fault on OOB pointers.
+    offs_token = tl.where(token_mask, offs_token, 0)
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
@@ -1438,8 +1443,8 @@ def get_moe_wna16_block_config(
     if not use_moe_wna16_cuda:
         # triton moe wna16 kernel
         if _is_volta():
-            # Volta tuning derived from benchmarks (int4), matching
-            # PR #32597 approach.
+            # Volta (SM 7.0): keep num_stages=1 everywhere to avoid
+            # Triton software-pipeline issues on pre-Ampere GPUs.
             m = max(1, num_valid_tokens // max(1, real_top_k))
             if m <= 1:
                 return {
@@ -1448,18 +1453,11 @@ def get_moe_wna16_block_config(
                     "num_warps": 4,
                     "num_stages": 1,
                 }
-            if m <= 2:
-                return {
-                    "BLOCK_SIZE_N": 32,
-                    "BLOCK_SIZE_K": 32,
-                    "num_warps": 2,
-                    "num_stages": 1,
-                }
             return {
                 "BLOCK_SIZE_N": 32,
                 "BLOCK_SIZE_K": 32,
                 "num_warps": 2,
-                "num_stages": 2,
+                "num_stages": 1,
             }
         if num_valid_tokens // real_top_k == 1:
             # if bs=1, use a smaller BLOCK_SIZE_N
