@@ -182,10 +182,20 @@ def triton_reshape_and_cache_flash(
         num_stages = 4
         num_warps = 8
     else:  # cuda
-        num_stages = 10
-        num_warps = 16
-        if torch.cuda.get_device_capability(key.device)[0] < 9:
+        capability = torch.cuda.get_device_capability(key.device)[0]
+        if capability < 8:
+            # V100 / Volta: conservative settings to stay within
+            # shared memory and register limits of SM 7.x
+            num_stages = 2
+            num_warps = 4
             TILE_SIZE = min(512, TILE_SIZE)
+        elif capability < 9:
+            num_stages = 10
+            num_warps = 16
+            TILE_SIZE = min(512, TILE_SIZE)
+        else:
+            num_stages = 10
+            num_warps = 16
 
     # TODO(ngl): maybe replace with static launch grid to avoid overhead if
     #   using cudagraphs
@@ -360,8 +370,13 @@ def triton_reshape_and_cache_flash_diffkv(
         num_stages = 4
         num_warps = 8
     else:  # cuda
-        num_stages = 10
-        num_warps = 16
+        capability = torch.cuda.get_device_capability(key.device)[0]
+        if capability < 8:
+            num_stages = 2
+            num_warps = 4
+        else:
+            num_stages = 10
+            num_warps = 16
 
     # TODO(ngl): maybe replace with static launch grid to avoid overhead if
     #   using cudagraphs
