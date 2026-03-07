@@ -964,6 +964,29 @@ def invoke_fused_moe_wna16_v100_kernel(
         * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
     )
 
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "V100 MoE kernel launch: "
+        "A=%s(%s) B=%s(%s) C=%s(%s) "
+        "B_scale=%s(%s) B_zp=%s(%s) "
+        "sorted_ids=%s expert_ids=%s "
+        "N=%d K=%d EM=%d num_tokens=%d top_k=%d "
+        "group_size=%d has_zp=%s mul_routed=%s "
+        "A.strides=%s B.strides=%s C.strides=%s "
+        "B_scale.strides=%s B_zp.strides=%s",
+        A.shape, A.dtype, B.shape, B.dtype, C.shape, C.dtype,
+        B_scale.shape, B_scale.dtype,
+        B_zp.shape if B_zp is not None else None,
+        B_zp.dtype if B_zp is not None else None,
+        sorted_token_ids.shape, expert_ids.shape,
+        B.size(1), A.size(1), EM, num_tokens, top_k,
+        block_shape[1], B_zp is not None, mul_routed_weight,
+        A.stride(), B.stride(), C.stride(),
+        B_scale.stride(),
+        B_zp.stride() if B_zp is not None else None,
+    )
+
     fused_moe_kernel_gptq_v100[grid](
         A,
         B,
