@@ -889,6 +889,72 @@ def dispatch_fused_moe_kernel(
                 block_shape,
             )
             return
+
+        # Volta (SM70) fallback: the fused_moe_kernel_gptq_awq triton
+        # kernel crashes on SM70 due to triton codegen issues. Dequantize
+        # weights to fp16 and use the standard fused_moe_kernel instead.
+        capability = current_platform.get_device_capability()
+        is_volta = (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability == (7, 0)
+        )
+        if is_volta and use_int4_w4a16:
+            group_size = block_shape[1]
+            E, N, K_packed = B.shape
+            K = K_packed * 2  # int4: 2 values per byte
+
+            # Dequantize int4 weights to fp16:
+            # B is [E, N, K//2] uint8, each byte holds 2 int4 values
+            B_unpacked_lo = (B & 0xF).to(torch.float16)
+            B_unpacked_hi = (B >> 4).to(torch.float16)
+            # Interleave: shape [E, N, K]
+            B_fp16 = torch.stack([B_unpacked_lo, B_unpacked_hi],
+                                 dim=-1).reshape(E, N, K)
+
+            # Apply scale: B_scale is [E, N, K // group_size]
+            # Expand scale to [E, N, K]
+            if B_zp is not None:
+                B_zp_unpacked_lo = (B_zp & 0xF).to(torch.float16)
+                B_zp_unpacked_hi = (B_zp >> 4).to(torch.float16)
+                B_zp_fp16 = torch.stack(
+                    [B_zp_unpacked_lo, B_zp_unpacked_hi],
+                    dim=-1).reshape(B_zp.shape[0], B_zp.shape[1], -1)
+                B_zp_expanded = B_zp_fp16.repeat_interleave(
+                    group_size, dim=-1)[:, :, :K]
+                B_fp16 = B_fp16 - B_zp_expanded
+            else:
+                B_fp16 = B_fp16 - 8.0  # symmetric quant zero point
+
+            B_scale_expanded = B_scale.repeat_interleave(
+                group_size, dim=-1)[:, :, :K]
+            B_fp16 = B_fp16 * B_scale_expanded
+
+            # Use standard fused_moe_kernel with dequantized weights
+            invoke_fused_moe_triton_kernel(
+                A,
+                B_fp16,
+                C,
+                None,  # A_scale
+                None,  # B_scale (already applied)
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                top_k,
+                config,
+                compute_type,
+                False,  # use_fp8_w8a8
+                False,  # use_int8_w8a8
+                False,  # use_int8_w8a16
+                False,  # use_int4_w4a16
+                False,  # per_channel_quant
+                None,   # block_shape
+                None,   # B_bias
+            )
+            return
+
         invoke_fused_moe_wna16_triton_kernel(
             A,
             B,
