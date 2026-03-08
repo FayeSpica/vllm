@@ -910,7 +910,7 @@ def dispatch_fused_moe_kernel(
             B_unpacked_hi = (B >> 4).to(torch.float16)
             # Interleave: shape [E, N, K]
             B_fp16 = torch.stack([B_unpacked_lo, B_unpacked_hi],
-                                 dim=-1).reshape(E, N, K)
+                                 dim=-1).reshape(E, N, K).contiguous()
 
             # Apply scale: B_scale is [E, N, K // group_size]
             # Expand scale to [E, N, K]
@@ -930,29 +930,64 @@ def dispatch_fused_moe_kernel(
                 group_size, dim=-1)[:, :, :K]
             B_fp16 = B_fp16 * B_scale_expanded
 
-            # Use standard fused_moe_kernel with dequantized weights
-            invoke_fused_moe_triton_kernel(
-                A,
-                B_fp16,
-                C,
-                None,  # A_scale
-                None,  # B_scale (already applied)
-                topk_weights,
-                sorted_token_ids,
-                expert_ids,
-                num_tokens_post_padded,
-                mul_routed_weight,
-                top_k,
-                config,
-                compute_type,
-                False,  # use_fp8_w8a8
-                False,  # use_int8_w8a8
-                False,  # use_int8_w8a16
-                False,  # use_int4_w4a16
-                False,  # per_channel_quant
-                None,   # block_shape
-                None,   # B_bias
-            )
+            # Pure PyTorch MoE computation — all triton MoE kernels crash
+            # on SM70 (Volta) due to triton codegen issues.
+            # B_fp16: [E, N, K], A: [M, K], C: [M, top_k, N]
+            num_valid_tokens = A.size(0) * top_k
+            C_flat = C.view(-1, C.size(-1))
+            BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
+
+            if sorted_token_ids is not None:
+                # Non-naive path: tokens sorted by expert in blocks
+                for e in range(E):
+                    block_mask = (expert_ids == e)
+                    if not block_mask.any():
+                        continue
+                    block_indices = block_mask.nonzero(
+                        as_tuple=False).view(-1)
+
+                    all_token_ids = []
+                    for b_idx in block_indices:
+                        start = b_idx.item() * BLOCK_SIZE_M
+                        end = min(start + BLOCK_SIZE_M,
+                                  sorted_token_ids.size(0))
+                        chunk = sorted_token_ids[start:end]
+                        valid = chunk[chunk < num_valid_tokens]
+                        if valid.numel() > 0:
+                            all_token_ids.append(valid)
+
+                    if not all_token_ids:
+                        continue
+                    token_ids = torch.cat(all_token_ids)
+
+                    a_rows = A[token_ids // top_k]
+                    # B_fp16[e] is [N, K], .T gives [K, N]
+                    result = a_rows @ B_fp16[e].T
+
+                    if mul_routed_weight and topk_weights is not None:
+                        weights = topk_weights.view(-1)[
+                            token_ids].unsqueeze(-1)
+                        result = result * weights
+
+                    C_flat[token_ids] = result.to(C.dtype)
+            else:
+                # Naive block assignment: expert_ids = topk_ids.view(-1)
+                for e in range(E):
+                    token_mask = (expert_ids == e)
+                    if not token_mask.any():
+                        continue
+                    token_ids = token_mask.nonzero(
+                        as_tuple=False).view(-1)
+
+                    a_rows = A[token_ids // top_k]
+                    result = a_rows @ B_fp16[e].T
+
+                    if mul_routed_weight and topk_weights is not None:
+                        weights = topk_weights.view(-1)[
+                            token_ids].unsqueeze(-1)
+                        result = result * weights
+
+                    C_flat[token_ids] = result.to(C.dtype)
             return
 
         invoke_fused_moe_wna16_triton_kernel(
