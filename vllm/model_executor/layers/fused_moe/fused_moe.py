@@ -1158,27 +1158,14 @@ def get_moe_wna16_block_config(
             and capability == (7, 0)
         )
         if is_volta:
-            # Volta tuning derived from local benchmarks (int4).
-            m = max(1, num_valid_tokens // max(1, real_top_k))
-            if m <= 1:
-                return {
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 32,
-                    "num_warps": 4,
-                    "num_stages": 1,
-                }
-            if m <= 2:
-                return {
-                    "BLOCK_SIZE_N": 32,
-                    "BLOCK_SIZE_K": 32,
-                    "num_warps": 2,
-                    "num_stages": 1,
-                }
+            # Volta: use BLOCK_SIZE_K matching group_size to avoid
+            # triton codegen issues with fractional group coverage.
+            volta_k = max(32, group_size)
             return {
                 "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32,
-                "num_warps": 2,
-                "num_stages": 2,
+                "BLOCK_SIZE_K": volta_k,
+                "num_warps": 4,
+                "num_stages": 1,
             }
         if num_valid_tokens // real_top_k == 1:
             # if bs=1, use a smaller BLOCK_SIZE_N
