@@ -903,39 +903,41 @@ def dispatch_fused_moe_kernel(
             group_size = block_shape[1]
             E, N, K_packed = B.shape
             K = K_packed * 2  # int4: 2 values per byte
+            has_zp = B_zp is not None
 
-            # Dequantize int4 weights to fp16:
-            # B is [E, N, K//2] uint8, each byte holds 2 int4 values
-            B_unpacked_lo = (B & 0xF).to(torch.float16)
-            B_unpacked_hi = (B >> 4).to(torch.float16)
-            # Interleave: shape [E, N, K]
-            B_fp16 = torch.stack([B_unpacked_lo, B_unpacked_hi],
-                                 dim=-1).reshape(E, N, K).contiguous()
-
-            # Apply scale: B_scale is [E, N, K // group_size]
-            # Expand scale to [E, N, K]
-            if B_zp is not None:
-                B_zp_unpacked_lo = (B_zp & 0xF).to(torch.float16)
-                B_zp_unpacked_hi = (B_zp >> 4).to(torch.float16)
-                B_zp_fp16 = torch.stack(
-                    [B_zp_unpacked_lo, B_zp_unpacked_hi],
-                    dim=-1).reshape(B_zp.shape[0], B_zp.shape[1], -1)
-                B_zp_expanded = B_zp_fp16.repeat_interleave(
-                    group_size, dim=-1)[:, :, :K]
-                B_fp16 = B_fp16 - B_zp_expanded
-            else:
-                B_fp16 = B_fp16 - 8.0  # symmetric quant zero point
-
-            B_scale_expanded = B_scale.repeat_interleave(
-                group_size, dim=-1)[:, :, :K]
-            B_fp16 = B_fp16 * B_scale_expanded
-
-            # Pure PyTorch MoE computation — all triton MoE kernels crash
-            # on SM70 (Volta) due to triton codegen issues.
-            # B_fp16: [E, N, K], A: [M, K], C: [M, top_k, N]
+            # Pure PyTorch MoE with per-expert dequantization.
+            # All triton MoE kernels crash on SM70 (Volta).
+            # Dequant per-expert to avoid huge temp tensors (~GB).
+            # A: [M, K], B: [E, N, K//2] uint8, C: [M, top_k, N]
             num_valid_tokens = A.size(0) * top_k
             C_flat = C.view(-1, C.size(-1))
             BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
+
+            def _dequant_expert(e_idx):
+                """Dequant single expert: B[e] uint8 -> fp16 [N, K]."""
+                b_e = B[e_idx]  # [N, K_packed] uint8
+                b_lo = (b_e & 0xF).to(torch.float16)
+                b_hi = (b_e >> 4).to(torch.float16)
+                b_fp16 = torch.stack([b_lo, b_hi], dim=-1).reshape(N, K)
+
+                if has_zp:
+                    zp_e = B_zp[e_idx]  # [N, K_packed//group_size??]
+                    zp_lo = (zp_e & 0xF).to(torch.float16)
+                    zp_hi = (zp_e >> 4).to(torch.float16)
+                    zp_fp16 = torch.stack(
+                        [zp_lo, zp_hi], dim=-1).reshape(
+                        zp_e.shape[0], -1)
+                    zp_expanded = zp_fp16.repeat_interleave(
+                        group_size, dim=-1)[:, :K]
+                    b_fp16 = b_fp16 - zp_expanded
+                else:
+                    b_fp16 = b_fp16 - 8.0  # symmetric quant
+
+                s_e = B_scale[e_idx]  # [N, K//group_size]
+                s_expanded = s_e.repeat_interleave(
+                    group_size, dim=-1)[:, :K]
+                b_fp16 = b_fp16 * s_expanded
+                return b_fp16
 
             if sorted_token_ids is not None:
                 # Non-naive path: tokens sorted by expert in blocks
@@ -961,8 +963,9 @@ def dispatch_fused_moe_kernel(
                     token_ids = torch.cat(all_token_ids)
 
                     a_rows = A[token_ids // top_k]
-                    # B_fp16[e] is [N, K], .T gives [K, N]
-                    result = a_rows @ B_fp16[e].T
+                    b_fp16_e = _dequant_expert(e)
+                    # b_fp16_e is [N, K], .T gives [K, N]
+                    result = a_rows @ b_fp16_e.T
 
                     if mul_routed_weight and topk_weights is not None:
                         weights = topk_weights.view(-1)[
@@ -980,7 +983,8 @@ def dispatch_fused_moe_kernel(
                         as_tuple=False).view(-1)
 
                     a_rows = A[token_ids // top_k]
-                    result = a_rows @ B_fp16[e].T
+                    b_fp16_e = _dequant_expert(e)
+                    result = a_rows @ b_fp16_e.T
 
                     if mul_routed_weight and topk_weights is not None:
                         weights = topk_weights.view(-1)[
