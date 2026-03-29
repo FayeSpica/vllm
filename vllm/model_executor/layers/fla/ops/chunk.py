@@ -11,6 +11,8 @@ import warnings
 
 import torch
 
+from vllm.triton_utils.allocation import set_triton_allocator
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -19,6 +21,15 @@ from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
+
+_triton_allocator_set = False
+
+
+def _ensure_triton_allocator(device: torch.device):
+    global _triton_allocator_set
+    if not _triton_allocator_set:
+        set_triton_allocator(device)
+        _triton_allocator_set = True
 
 
 def chunk_gated_delta_rule_fwd(
@@ -32,6 +43,7 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
 ):
+    _ensure_triton_allocator(q.device)
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
