@@ -10,15 +10,16 @@ def set_triton_allocator(device: torch.device):
     def alloc_fn(size: int, alignment: int, stream: int | None):
         return torch.empty(size, device=device, dtype=torch.int8)
 
-    # Try the standard API first
+    # Standard API
     triton.set_allocator(alloc_fn)
 
-    # Also directly patch the runtime allocator as a fallback,
-    # in case triton.set_allocator doesn't propagate correctly
-    # (e.g. in distributed environments where CUDA_VISIBLE_DEVICES
-    # is temporarily empty during triton import).
+    # Workaround for triton bug: jit.py imports _allocator by value
+    # (from triton.runtime._allocation import _allocator), creating a
+    # snapshot bound to None at import time. triton.set_allocator()
+    # updates _allocation._allocator but NOT jit.py's local binding.
+    # We must patch jit.py's module namespace directly.
     try:
-        from triton.runtime import _allocation
-        _allocation._allocator = alloc_fn
+        import triton.runtime.jit as _jit_module
+        _jit_module._allocator = alloc_fn
     except (ImportError, AttributeError):
         pass
