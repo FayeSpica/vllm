@@ -256,6 +256,12 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
+            # Set triton allocator for scratch memory (required by triton
+            # >= 3.x). Must be done after device init and before any
+            # torch.compile / CUDA graph capture.
+            from vllm.triton_utils.allocation import set_triton_allocator
+            set_triton_allocator(self.device)
+
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
